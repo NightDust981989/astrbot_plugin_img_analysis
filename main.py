@@ -8,7 +8,6 @@ import asyncio
 import exifread
 import os
 import tempfile
-import urllib.parse
 from typing import Optional, Tuple
 
 
@@ -16,7 +15,7 @@ from typing import Optional, Tuple
     "astrbot_plugin_image_metadata",
     "NightDust981989",
     "一个用于解析图片元数据的插件（QQ平台专用）",
-    "3.0.0",
+    "3.1.0",
     "https://github.com/xxx/astrbot_plugin_image_metadata"
 )
 class ImageMetadataPlugin(Star):
@@ -38,10 +37,14 @@ class ImageMetadataPlugin(Star):
         self.prompt_send_image = self.metadata_settings.get("prompt_send_image", "📷 请发送要解析的图片（30秒内有效）")
         self.prompt_timeout = self.metadata_settings.get("prompt_timeout", "⏰ 解析请求已超时，请重新发送命令")
         self.max_exif_show = self.metadata_settings.get("max_exif_show", 20)
-        self.tianditu_api_url = "https://api.tianditu.gov.cn/geocoder"
 
     async def initialize(self):
-        self.client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        # 初始化HTTP客户端（增加超时+SSL容错）
+        connector = aiohttp.TCPConnector(ssl=False)  # 解决部分环境SSL验证失败问题
+        self.client = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=30)
+        )
         logger.info("图片元数据解析插件已初始化（使用exifread解析GPS）")
 
     def _convert_exif_gps(self, gps_coords, ref) -> float:
@@ -78,47 +81,91 @@ class ImageMetadataPlugin(Star):
             longitude = self._convert_exif_gps(gps_lon, gps_lon_ref.values)
 
             if latitude == 0.0 and longitude == 0.0:
-                return None, None, "GPS坐标无效"
+                return None, None, "GPS坐标无效（值为0）"
 
             gps_str = f"纬度：{latitude}° {gps_lat_ref.values}，经度：{longitude}° {gps_lon_ref.values}"
             return latitude, longitude, gps_str
         except Exception as e:
             logger.error(f"解析GPS失败: {e}")
-            return None, None, f"GPS解析异常: {str(e)[:20]}"
+            return None, None, f"GPS解析异常: {str(e)[:20]}..."
 
     async def _gps_to_address(self, lat: float, lon: float) -> str:
+        """优化版天地图API调用（增加调试+容错+多格式兼容）"""
         if not self.tianditu_api_key:
-            return "未配置天地图API Key，无法解析地址（请在配置文件中设置tianditu_api_key）"
+            return "❌ 未配置天地图API Key\n请前往 https://www.tianditu.gov.cn/ 申请Web服务类型的TK，并在配置文件中设置 tianditu_api_key"
+
+        # 基础参数校验
+        if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+            return f"❌ GPS坐标无效\n纬度范围需为[-90,90]，经度范围需为[-180,180]，当前：纬度{lat}，经度{lon}"
 
         try:
-            params = {
-                "postStr": urllib.parse.quote(f'{{"lon":{lon},"lat":{lat},"ver":1}}'),
-                "type": "geocode",
-                "tk": self.tianditu_api_key
+            # 方案1：标准POST请求（推荐，天地图官方文档推荐POST）
+            post_data = {
+                "lon": lon,
+                "lat": lat,
+                "ver": 1
             }
-            async with self.client.get(self.tianditu_api_url, params=params) as resp:
-                resp.raise_for_status()
+            headers = {
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            # 天地图逆地理编码正确地址（优先用这个）
+            api_url = f"https://api.tianditu.gov.cn/geocoder?type=geocode&tk={self.tianditu_api_key}"
+            
+            async with self.client.post(
+                api_url,
+                json=post_data,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                # 打印完整响应日志（调试用）
+                logger.debug(f"天地图API响应状态码: {resp.status}")
+                logger.debug(f"天地图API响应头: {dict(resp.headers)}")
+                response_text = await resp.text()
+                logger.debug(f"天地图API原始响应: {response_text[:500]}")
+                
+                resp.raise_for_status()  # 触发HTTP错误（4xx/5xx）
                 data = await resp.json()
 
-            if data.get("code") == 0 and data.get("result"):
-                result = data["result"]
+            # 解析响应（兼容天地图多版本返回格式）
+            if data.get("code") == 0:
+                result = data.get("result", {})
+                # 提取地址层级（兼容不同返回格式）
+                address = result.get("address", "") or result.get("formatted_address", "")
+                if address:
+                    return f"📍 解析地址：{address}"
+                
+                # 分级提取地址（备用方案）
                 province = result.get("province", "")
-                city = result.get("city", "")
+                city = result.get("city", "") or result.get("citycode", "")
                 district = result.get("district", "")
                 street = result.get("street", "")
                 number = result.get("number", "")
                 
-                address_parts = [province, city, district, street, number]
-                address_str = "实际地址：" + "".join([p for p in address_parts if p])
-                if not address_str.endswith("："):
-                    return address_str
+                address_parts = [p for p in [province, city, district, street, number] if p]
+                if address_parts:
+                    return f"📍 解析地址：{' '.join(address_parts)}"
                 else:
-                    return "实际地址：未匹配到详细地址"
+                    return "📍 解析地址：未匹配到详细地址（仅定位到大致区域）"
             else:
-                return f"地址解析失败：{data.get('msg', '未知错误')}（错误码：{data.get('code', '未知')}）"
+                error_msg = data.get("msg", "未知错误")
+                error_code = data.get("code", "未知码")
+                return f"❌ 地址解析失败\n错误码：{error_code}\n错误信息：{error_msg}"
+
+        except aiohttp.ClientError as e:
+            # 网络错误（超时/连接失败/SSL错误）
+            logger.error(f"天地图API网络错误: {str(e)}")
+            return f"❌ 地址解析失败（网络错误）\n{str(e)[:30]}...\n请检查网络或稍后重试"
+        except asyncio.TimeoutError:
+            return "❌ 地址解析超时（天地图API响应超过10秒）"
+        except ValueError as e:
+            # JSON解析失败
+            logger.error(f"天地图API响应JSON解析失败: {str(e)}")
+            return f"❌ 地址解析失败（响应格式错误）\n{str(e)[:30]}..."
         except Exception as e:
-            logger.error(f"GPS转地址失败: {e}")
-            return f"地址解析异常：{str(e)[:50]}..."
+            # 其他未知错误
+            logger.error(f"天地图API调用未知错误: {str(e)}")
+            return f"❌ 地址解析失败（未知错误）\n{str(e)[:30]}..."
 
     def _parse_image_meta(self, image_path: str) -> dict:
         """使用exifread解析完整Exif数据"""
