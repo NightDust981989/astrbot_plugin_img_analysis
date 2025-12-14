@@ -244,7 +244,7 @@ class ImageMetadataPlugin(Star):
             chain.append(Comp.Plain("\n"))
 
             # GPS信息
-            gps_lines = ["【GPS信息】", meta["gps"]["str"]]
+            gps_lines = ["\n【GPS信息】", meta["gps"]["str"]]
             if meta["gps"]["lat"] and meta["gps"]["lon"]:
                 address_str = await self._gps_to_address(meta["gps"]["lat"], meta["gps"]["lon"])
                 gps_lines.append(address_str)
@@ -252,7 +252,7 @@ class ImageMetadataPlugin(Star):
             chain.append(Comp.Plain("\n"))
 
             # Exif信息
-            exif_lines = ["【Exif数据】"]
+            exif_lines = ["\n【Exif数据】"]
             if meta["exif"]:
                 exif_items = list(meta["exif"].items())[:self.max_exif_show]
                 for k, v in exif_items:
