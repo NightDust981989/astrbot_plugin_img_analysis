@@ -8,6 +8,7 @@ import asyncio
 import exifread
 import os
 import tempfile
+import urllib.parse
 from typing import Optional, Tuple
 
 
@@ -15,7 +16,7 @@ from typing import Optional, Tuple
     "astrbot_plugin_image_metadata",
     "NightDust981989",
     "一个用于解析图片元数据的插件（QQ平台专用）",
-    "3.1.0",
+    "3.2.0",
     "https://github.com/xxx/astrbot_plugin_image_metadata"
 )
 class ImageMetadataPlugin(Star):
@@ -90,7 +91,7 @@ class ImageMetadataPlugin(Star):
             return None, None, f"GPS解析异常: {str(e)[:20]}..."
 
     async def _gps_to_address(self, lat: float, lon: float) -> str:
-        """优化版天地图API调用（增加调试+容错+多格式兼容）"""
+        """严格按照天地图官方GET模板调用API"""
         if not self.tianditu_api_key:
             return "❌ 未配置天地图API Key\n请前往 https://www.tianditu.gov.cn/ 申请Web服务类型的TK，并在配置文件中设置 tianditu_api_key"
 
@@ -99,38 +100,44 @@ class ImageMetadataPlugin(Star):
             return f"❌ GPS坐标无效\n纬度范围需为[-90,90]，经度范围需为[-180,180]，当前：纬度{lat}，经度{lon}"
 
         try:
-            # 方案1：标准POST请求（推荐，天地图官方文档推荐POST）
-            post_data = {
-                "lon": lon,
-                "lat": lat,
-                "ver": 1
-            }
-            headers = {
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
-            # 天地图逆地理编码正确地址（优先用这个）
-            api_url = f"https://api.tianditu.gov.cn/geocoder?type=geocode&tk={self.tianditu_api_key}"
+            # 严格按照天地图官方模板构建请求参数
+            # 步骤1：构建postStr字符串（单引号，与官方模板一致）
+            post_str = f"{{'lon':{lon},'lat':{lat},'ver':1}}"
+            # 步骤2：URL编码postStr（避免特殊字符问题）
+            encoded_post_str = urllib.parse.quote(post_str)
+            # 步骤3：拼接完整API URL（与官方模板完全一致）
+            api_url = (
+                f"http://api.tianditu.gov.cn/geocoder?"
+                f"postStr={encoded_post_str}&type=geocode&tk={self.tianditu_api_key}"
+            )
             
-            async with self.client.post(
+            # 打印最终请求URL（调试用）
+            logger.debug(f"天地图API请求URL: {api_url}")
+            
+            # 发送GET请求（官方模板指定GET）
+            async with self.client.get(
                 api_url,
-                json=post_data,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=10),
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
             ) as resp:
-                # 打印完整响应日志（调试用）
+                # 打印完整响应日志
                 logger.debug(f"天地图API响应状态码: {resp.status}")
                 logger.debug(f"天地图API响应头: {dict(resp.headers)}")
                 response_text = await resp.text()
                 logger.debug(f"天地图API原始响应: {response_text[:500]}")
                 
                 resp.raise_for_status()  # 触发HTTP错误（4xx/5xx）
-                data = await resp.json()
+                
+                # 处理响应（兼容JSON格式，替换单引号为双引号）
+                response_json = response_text.replace("'", "\"")
+                data = await asyncio.to_thread(lambda: __import__('json').loads(response_json))
 
-            # 解析响应（兼容天地图多版本返回格式）
+            # 解析响应结果
             if data.get("code") == 0:
                 result = data.get("result", {})
-                # 提取地址层级（兼容不同返回格式）
+                # 提取地址（兼容天地图多版本返回格式）
                 address = result.get("address", "") or result.get("formatted_address", "")
                 if address:
                     return f"📍 解析地址：{address}"
@@ -160,7 +167,7 @@ class ImageMetadataPlugin(Star):
             return "❌ 地址解析超时（天地图API响应超过10秒）"
         except ValueError as e:
             # JSON解析失败
-            logger.error(f"天地图API响应JSON解析失败: {str(e)}")
+            logger.error(f"天地图API响应JSON解析失败: {str(e)} | 响应内容: {response_text[:100]}")
             return f"❌ 地址解析失败（响应格式错误）\n{str(e)[:30]}..."
         except Exception as e:
             # 其他未知错误
