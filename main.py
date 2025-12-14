@@ -9,6 +9,7 @@ import exifread
 import os
 import tempfile
 import urllib.parse
+import json
 from typing import Optional, Tuple
 
 
@@ -16,7 +17,7 @@ from typing import Optional, Tuple
     "astrbot_plugin_image_metadata",
     "NightDust981989",
     "一个用于解析图片元数据的插件（QQ平台专用）",
-    "3.2.0",
+    "3.3.0",
     "https://github.com/xxx/astrbot_plugin_image_metadata"
 )
 class ImageMetadataPlugin(Star):
@@ -40,8 +41,8 @@ class ImageMetadataPlugin(Star):
         self.max_exif_show = self.metadata_settings.get("max_exif_show", 20)
 
     async def initialize(self):
-        # 初始化HTTP客户端（增加超时+SSL容错）
-        connector = aiohttp.TCPConnector(ssl=False)  # 解决部分环境SSL验证失败问题
+        # 初始化HTTP客户端（强制HTTPS，关闭SSL验证）
+        connector = aiohttp.TCPConnector(ssl=False)
         self.client = aiohttp.ClientSession(
             connector=connector,
             timeout=aiohttp.ClientTimeout(total=30)
@@ -49,7 +50,7 @@ class ImageMetadataPlugin(Star):
         logger.info("图片元数据解析插件已初始化（使用exifread解析GPS）")
 
     def _convert_exif_gps(self, gps_coords, ref) -> float:
-        """将Exif格式的GPS坐标转换为十进制"""
+        """将Exif格式的GPS坐标转换为十进制（限制6位小数，避免长度超限）"""
         try:
             # exifread返回的是度分秒元组 (deg, min, sec)
             deg = float(gps_coords.values[0].num) / float(gps_coords.values[0].den)
@@ -59,7 +60,7 @@ class ImageMetadataPlugin(Star):
             dd = deg + (min / 60.0) + (sec / 3600.0)
             if ref in ['S', 'W']:
                 dd = -dd
-            return round(dd, 6)
+            return round(dd, 6)  # 限制6位小数，避免参数过长
         except Exception as e:
             logger.warning(f"GPS坐标转换失败: {e}")
             return 0.0
@@ -91,7 +92,7 @@ class ImageMetadataPlugin(Star):
             return None, None, f"GPS解析异常: {str(e)[:20]}..."
 
     async def _gps_to_address(self, lat: float, lon: float) -> str:
-        """严格按照天地图官方GET模板调用API"""
+        """修复308011错误：合规参数格式 + HTTPS + 长度限制"""
         if not self.tianditu_api_key:
             return "❌ 未配置天地图API Key\n请前往 https://www.tianditu.gov.cn/ 申请Web服务类型的TK，并在配置文件中设置 tianditu_api_key"
 
@@ -100,49 +101,53 @@ class ImageMetadataPlugin(Star):
             return f"❌ GPS坐标无效\n纬度范围需为[-90,90]，经度范围需为[-180,180]，当前：纬度{lat}，经度{lon}"
 
         try:
-            # 严格按照天地图官方模板构建请求参数
-            # 步骤1：构建postStr字符串（单引号，与官方模板一致）
-            post_str = f"{{'lon':{lon},'lat':{lat},'ver':1}}"
-            # 步骤2：URL编码postStr（避免特殊字符问题）
+            # 关键修复1：使用双引号的标准JSON格式（解决参数非法问题）
+            post_data = {
+                "lon": lon,
+                "lat": lat,
+                "ver": 1
+            }
+            # 关键修复2：JSON序列化（保证格式合规）+ URL编码（避免特殊字符）
+            post_str = json.dumps(post_data, ensure_ascii=False)
             encoded_post_str = urllib.parse.quote(post_str)
-            # 步骤3：拼接完整API URL（与官方模板完全一致）
+            
+            # 关键修复3：使用HTTPS协议（HTTP会触发参数合规检测）
             api_url = (
-                f"http://api.tianditu.gov.cn/geocoder?"
+                f"https://api.tianditu.gov.cn/geocoder?"
                 f"postStr={encoded_post_str}&type=geocode&tk={self.tianditu_api_key}"
             )
             
-            # 打印最终请求URL（调试用）
+            # 打印调试信息
             logger.debug(f"天地图API请求URL: {api_url}")
+            logger.debug(f"原始postStr: {post_str}")
+            logger.debug(f"编码后postStr: {encoded_post_str}")
             
-            # 发送GET请求（官方模板指定GET）
+            # 发送GET请求（合规格式）
             async with self.client.get(
                 api_url,
                 timeout=aiohttp.ClientTimeout(total=10),
                 headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json"
                 }
             ) as resp:
-                # 打印完整响应日志
+                # 打印响应日志
                 logger.debug(f"天地图API响应状态码: {resp.status}")
-                logger.debug(f"天地图API响应头: {dict(resp.headers)}")
                 response_text = await resp.text()
                 logger.debug(f"天地图API原始响应: {response_text[:500]}")
                 
                 resp.raise_for_status()  # 触发HTTP错误（4xx/5xx）
-                
-                # 处理响应（兼容JSON格式，替换单引号为双引号）
-                response_json = response_text.replace("'", "\"")
-                data = await asyncio.to_thread(lambda: __import__('json').loads(response_json))
+                data = json.loads(response_text)
 
             # 解析响应结果
             if data.get("code") == 0:
                 result = data.get("result", {})
-                # 提取地址（兼容天地图多版本返回格式）
+                # 提取地址（兼容多版本）
                 address = result.get("address", "") or result.get("formatted_address", "")
                 if address:
                     return f"📍 解析地址：{address}"
                 
-                # 分级提取地址（备用方案）
+                # 分级提取地址
                 province = result.get("province", "")
                 city = result.get("city", "") or result.get("citycode", "")
                 district = result.get("district", "")
@@ -160,17 +165,14 @@ class ImageMetadataPlugin(Star):
                 return f"❌ 地址解析失败\n错误码：{error_code}\n错误信息：{error_msg}"
 
         except aiohttp.ClientError as e:
-            # 网络错误（超时/连接失败/SSL错误）
             logger.error(f"天地图API网络错误: {str(e)}")
             return f"❌ 地址解析失败（网络错误）\n{str(e)[:30]}...\n请检查网络或稍后重试"
         except asyncio.TimeoutError:
             return "❌ 地址解析超时（天地图API响应超过10秒）"
-        except ValueError as e:
-            # JSON解析失败
-            logger.error(f"天地图API响应JSON解析失败: {str(e)} | 响应内容: {response_text[:100]}")
+        except json.JSONDecodeError as e:
+            logger.error(f"天地图API响应JSON解析失败: {str(e)} | 响应: {response_text[:100]}")
             return f"❌ 地址解析失败（响应格式错误）\n{str(e)[:30]}..."
         except Exception as e:
-            # 其他未知错误
             logger.error(f"天地图API调用未知错误: {str(e)}")
             return f"❌ 地址解析失败（未知错误）\n{str(e)[:30]}..."
 
@@ -312,7 +314,7 @@ class ImageMetadataPlugin(Star):
 
         except Exception as e:
             logger.error(f"处理解析结果失败: {e}")
-            await event.send(event.plain_result(f"❌ 解析结果处理失败: {str(e)[:50]}..."))
+            await event.send(event.plain_result(f"解析结果处理失败: {str(e)[:50]}..."))
 
     @filter.command("imgmeta", "图片元数据", "解析图片元数据")
     async def imgmeta_handler(self, event: AstrMessageEvent, args=None):
