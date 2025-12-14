@@ -5,8 +5,7 @@ from astrbot.api.message_components import Image as MsgImage, Reply, Plain
 import astrbot.api.message_components as Comp
 import aiohttp
 import asyncio
-from PIL import Image as PILImage
-from PIL.ExifTags import TAGS, GPSTAGS
+import exifread
 import os
 import tempfile
 import urllib.parse
@@ -17,7 +16,7 @@ from typing import Optional, Tuple
     "astrbot_plugin_image_metadata",
     "NightDust981989",
     "一个用于解析图片元数据的插件（QQ平台专用）",
-    "2.2.0",
+    "3.0.0",
     "https://github.com/xxx/astrbot_plugin_image_metadata"
 )
 class ImageMetadataPlugin(Star):
@@ -43,81 +42,49 @@ class ImageMetadataPlugin(Star):
 
     async def initialize(self):
         self.client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
-        logger.info("图片元数据解析插件已初始化（仅支持QQ平台）")
+        logger.info("图片元数据解析插件已初始化（使用exifread解析GPS）")
 
-    def _decode_value(self, value) -> str:
-        if isinstance(value, bytes):
-            try:
-                return value.decode("utf-8", errors="ignore")
-            except:
-                return value.decode("gbk", errors="ignore")
-        return str(value) if value is not None else "无"
-
-    def _dms_to_dd(self, dms: tuple, ref: str) -> float:
-        """修复：兼容元组格式的度分秒（PIL返回的是分数元组）"""
+    def _convert_exif_gps(self, gps_coords, ref) -> float:
+        """将Exif格式的GPS坐标转换为十进制"""
         try:
-            # 处理PIL返回的分数格式 (numerator, denominator)
-            def to_float(val):
-                if isinstance(val, (tuple, list)) and len(val) == 2:
-                    return float(val[0]) / float(val[1])
-                return float(val)
+            # exifread返回的是度分秒元组 (deg, min, sec)
+            deg = float(gps_coords.values[0].num) / float(gps_coords.values[0].den)
+            min = float(gps_coords.values[1].num) / float(gps_coords.values[1].den)
+            sec = float(gps_coords.values[2].num) / float(gps_coords.values[2].den)
             
-            deg = to_float(dms[0])
-            minute = to_float(dms[1])
-            sec = to_float(dms[2]) if len(dms) >= 3 else 0.0
-            
-            dd = deg + (minute / 60.0) + (sec / 3600.0)
+            dd = deg + (min / 60.0) + (sec / 3600.0)
             if ref in ['S', 'W']:
                 dd = -dd
             return round(dd, 6)
         except Exception as e:
-            logger.warning(f"度分秒转换失败: {e}")
+            logger.warning(f"GPS坐标转换失败: {e}")
             return 0.0
 
-    def _parse_gps(self, exif_data) -> Tuple[Optional[float], Optional[float], str]:
-        """重构GPS解析逻辑：正确提取嵌套的GPSInfo"""
-        gps_info = {}
-        gps_tag_id = None
-        
-        # 第一步：找到GPSInfo对应的Tag ID（通常是34853）
-        for tag_id, tag_name in TAGS.items():
-            if tag_name == "GPSInfo":
-                gps_tag_id = tag_id
-                break
-        
-        if gps_tag_id is None or gps_tag_id not in exif_data:
-            logger.debug("Exif中未找到GPSInfo标签")
-            return None, None, "无GPS信息"
-        
-        # 第二步：解析嵌套的GPS数据
-        raw_gps = exif_data[gps_tag_id]
-        for gps_tag_id_inner, value in raw_gps.items():
-            gps_tag_name = GPSTAGS.get(gps_tag_id_inner, str(gps_tag_id_inner))
-            gps_info[gps_tag_name] = value
-        
-        # 调试日志：打印原始GPS数据
-        logger.debug(f"原始GPS数据: {gps_info}")
-        
-        # 核心GPS字段
-        lat_dms = gps_info.get('GPSLatitude')
-        lat_ref = gps_info.get('GPSLatitudeRef')
-        lon_dms = gps_info.get('GPSLongitude')
-        lon_ref = gps_info.get('GPSLongitudeRef')
+    def _parse_gps_exifread(self, exif_tags) -> Tuple[Optional[float], Optional[float], str]:
+        """使用exifread解析GPS"""
+        try:
+            # 提取GPS字段
+            gps_lat = exif_tags.get('GPS GPSLatitude')
+            gps_lat_ref = exif_tags.get('GPS GPSLatitudeRef')
+            gps_lon = exif_tags.get('GPS GPSLongitude')
+            gps_lon_ref = exif_tags.get('GPS GPSLongitudeRef')
 
-        if not all([lat_dms, lat_ref, lon_dms, lon_ref]):
-            logger.debug(f"缺失核心GPS字段 - 纬度：{lat_dms}/{lat_ref}，经度：{lon_dms}/{lon_ref}")
-            return None, None, "无GPS信息"
+            if not all([gps_lat, gps_lat_ref, gps_lon, gps_lon_ref]):
+                logger.debug("Exif中缺失GPS字段")
+                return None, None, "无GPS信息"
+            
+            # 转换为十进制坐标
+            latitude = self._convert_exif_gps(gps_lat, gps_lat_ref.values)
+            longitude = self._convert_exif_gps(gps_lon, gps_lon_ref.values)
 
-        # 转换为十进制经纬度
-        latitude = self._dms_to_dd(lat_dms, lat_ref)
-        longitude = self._dms_to_dd(lon_dms, lon_ref)
+            if latitude == 0.0 and longitude == 0.0:
+                return None, None, "GPS坐标无效"
 
-        if latitude == 0.0 and longitude == 0.0:
-            logger.debug("GPS坐标为0，判定为无效")
-            return None, None, "GPS坐标无效"
-
-        gps_str = f"纬度：{latitude}° {lat_ref}，经度：{longitude}° {lon_ref}"
-        return latitude, longitude, gps_str
+            gps_str = f"纬度：{latitude}° {gps_lat_ref.values}，经度：{longitude}° {gps_lon_ref.values}"
+            return latitude, longitude, gps_str
+        except Exception as e:
+            logger.error(f"解析GPS失败: {e}")
+            return None, None, f"GPS解析异常: {str(e)[:20]}"
 
     async def _gps_to_address(self, lat: float, lon: float) -> str:
         if not self.tianditu_api_key:
@@ -154,6 +121,7 @@ class ImageMetadataPlugin(Star):
             return f"地址解析异常：{str(e)[:50]}..."
 
     def _parse_image_meta(self, image_path: str) -> dict:
+        """使用exifread解析完整Exif数据"""
         result = {
             "basic": {},
             "exif": {},
@@ -163,34 +131,42 @@ class ImageMetadataPlugin(Star):
 
         try:
             # 基础文件信息
-            result["basic"]["文件大小(KB)"] = round(os.path.getsize(image_path) / 1024, 2)
+            file_size = os.path.getsize(image_path)
+            result["basic"]["文件大小(KB)"] = round(file_size / 1024, 2)
+            result["basic"]["文件大小(MB)"] = round(file_size / 1024 / 1024, 2)
+
+            # 解析Exif（使用exifread）
+            with open(image_path, 'rb') as f:
+                exif_tags = exifread.process_file(f, details=False)
             
-            # PIL解析图片信息
-            with PILImage.open(image_path) as img:
-                result["basic"]["格式"] = img.format or "未知"
-                result["basic"]["分辨率"] = f"{img.width} × {img.height}"
-                result["basic"]["色彩模式"] = img.mode or "未知"
+            # 提取基础图片信息
+            if exif_tags.get('Image ImageWidth'):
+                result["basic"]["宽度"] = f"{exif_tags['Image ImageWidth'].values} 像素"
+            if exif_tags.get('Image ImageLength'):
+                result["basic"]["高度"] = f"{exif_tags['Image ImageLength'].values} 像素"
+            if exif_tags.get('Image FileType'):
+                result["basic"]["格式"] = exif_tags['Image FileType'].values
+            if exif_tags.get('Image Make'):
+                result["basic"]["设备厂商"] = exif_tags['Image Make'].values
+            if exif_tags.get('Image Model'):
+                result["basic"]["设备型号"] = exif_tags['Image Model'].values
+            if exif_tags.get('Image DateTime'):
+                result["basic"]["拍摄时间"] = exif_tags['Image DateTime'].values
 
-                # 解析Exif数据
-                exif_data = img.getexif()
-                if exif_data:
-                    exif_dict = {}
-                    # 遍历所有Exif标签
-                    for tag_id, value in exif_data.items():
-                        tag_name = TAGS.get(tag_id, str(tag_id))
-                        # 跳过GPSInfo（单独解析）
-                        if tag_name != "GPSInfo":
-                            exif_dict[tag_name] = self._decode_value(value)
-                    
-                    # 单独解析GPS
-                    lat, lon, gps_str = self._parse_gps(exif_data)
-                    result["gps"]["lat"] = lat
-                    result["gps"]["lon"] = lon
-                    result["gps"]["str"] = gps_str
+            # 解析GPS
+            lat, lon, gps_str = self._parse_gps_exifread(exif_tags)
+            result["gps"]["lat"] = lat
+            result["gps"]["lon"] = lon
+            result["gps"]["str"] = gps_str
 
-                    result["exif"] = exif_dict
-                else:
-                    logger.debug("图片无Exif数据")
+            # 提取其他Exif字段
+            exif_dict = {}
+            for tag, value in exif_tags.items():
+                # 跳过GPS相关（已单独解析）和二进制数据
+                if not tag.startswith('GPS') and not isinstance(value.values, bytes):
+                    exif_dict[tag.replace(' ', '_')] = str(value.values)
+            
+            result["exif"] = exif_dict
 
         except Exception as e:
             result["error"] = str(e)[:80]
@@ -254,7 +230,7 @@ class ImageMetadataPlugin(Star):
             chain.append(Comp.Plain("\n"))
 
             # GPS信息
-            gps_lines = ["\n【GPS信息】", meta["gps"]["str"]]
+            gps_lines = ["【GPS信息】", meta["gps"]["str"]]
             if meta["gps"]["lat"] and meta["gps"]["lon"]:
                 address_str = await self._gps_to_address(meta["gps"]["lat"], meta["gps"]["lon"])
                 gps_lines.append(address_str)
@@ -262,16 +238,16 @@ class ImageMetadataPlugin(Star):
             chain.append(Comp.Plain("\n"))
 
             # Exif信息
-            exif_lines = ["\n【Exif数据】"]
+            exif_lines = ["【Exif详细数据】"]
             if meta["exif"]:
                 exif_items = list(meta["exif"].items())[:self.max_exif_show]
                 for k, v in exif_items:
-                    if v != "无":
+                    if v and v != "None":
                         exif_lines.append(f"{k}：{v}")
                 if len(meta["exif"]) > self.max_exif_show:
                     exif_lines.append(f"（共{len(meta['exif'])}个字段，仅展示前{self.max_exif_show}个）")
             else:
-                exif_lines.append("无Exif数据")
+                exif_lines.append("无Exif详细数据")
             chain.append(Comp.Plain("\n".join(exif_lines)))
 
             # 错误信息
