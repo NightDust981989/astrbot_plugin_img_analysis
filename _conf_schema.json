@@ -2,12 +2,12 @@
   "metadata_settings": {
     "description": "图片元数据解析插件设置",
     "type": "object",
-    "items": {
-      "tianditu_api_key": {
-        "description": "天地图API密钥（TK）",
+    "properties": {
+      "amap_api_key": {
+        "description": "高德地图API密钥（Key）",
         "type": "string",
         "default": "",
-        "hint": "前往https://www.tianditu.gov.cn/申请Web服务类型的TK"
+        "hint": "前往https://lbs.amap.com/申请Web服务类型的API Key（需开启逆地理编码权限）"
       },
       "timeout_seconds": {
         "description": "等待用户发送图片的超时时间（秒）",
