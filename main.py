@@ -171,6 +171,12 @@ class ImageMetadataPlugin(Star):
                     result["gps"]["str"] = gps_str
                     result["exif"] = exif_dict
 
+        except FileNotFoundError:
+            result["error"] = "文件未找到"
+            logger.error("解析元数据失败: 文件未找到")
+        except PILImage.UnidentifiedImageError:
+            result["error"] = "无法识别的图片格式"
+            logger.error("解析元数据失败: 无法识别的图片格式")
         except Exception as e:
             result["error"] = str(e)[:80]
             logger.error(f"解析元数据失败: {e}")
