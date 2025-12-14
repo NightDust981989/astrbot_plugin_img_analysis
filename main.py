@@ -314,7 +314,7 @@ class ImageMetadataPlugin(Star):
 
         except Exception as e:
             logger.error(f"处理解析结果失败: {e}")
-            await event.send(event.plain_result(f"解析结果处理失败: {str(e)[:50]}..."))
+            await event.send(event.plain_result(f"❌ 解析结果处理失败: {str(e)[:50]}..."))
 
     @filter.command("imgmeta", "图片元数据", "解析图片元数据")
     async def imgmeta_handler(self, event: AstrMessageEvent, args=None):
