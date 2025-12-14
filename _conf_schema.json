@@ -2,7 +2,7 @@
   "metadata_settings": {
     "description": "图片元数据解析插件设置",
     "type": "object",
-    "properties": {
+    "items": {
       "amap_api_key": {
         "description": "高德地图API密钥（Key）",
         "type": "string",
@@ -18,7 +18,7 @@
       "prompt_send_image": {
         "description": "提示用户发送图片的文字",
         "type": "string",
-        "default": "请发送要解析的图片（30秒内有效）",
+        "default": "请发送要解析的图片（30秒内有效。）",
         "hint": "可以自定义提示文字"
       },
       "prompt_timeout": {
