@@ -1,0 +1,38 @@
+{
+  "metadata_settings": {
+    "description": "图片元数据解析插件设置",
+    "type": "object",
+    "items": {
+      "tianditu_api_key": {
+        "description": "天地图API密钥（TK）",
+        "type": "string",
+        "default": "",
+        "hint": "前往https://www.tianditu.gov.cn/申请Web服务类型的TK"
+      },
+      "timeout_seconds": {
+        "description": "等待用户发送图片的超时时间（秒）",
+        "type": "int",
+        "default": 30,
+        "hint": "建议设置为30-60秒，给用户足够的时间发送图片"
+      },
+      "prompt_send_image": {
+        "description": "提示用户发送图片的文字",
+        "type": "string",
+        "default": "请发送要解析的图片（30秒内有效）",
+        "hint": "可以自定义提示文字"
+      },
+      "prompt_timeout": {
+        "description": "用户超时后的提示文字",
+        "type": "string",
+        "default": "解析请求已超时，请重新发送命令",
+        "hint": "可以自定义超时提示文字"
+      },
+      "max_exif_show": {
+        "description": "每次解析最多展示的Exif字段数量",
+        "type": "int",
+        "default": 20,
+        "hint": "过大可能导致回复内容过长"
+      }
+    }
+  }
+}
