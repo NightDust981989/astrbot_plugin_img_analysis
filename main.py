@@ -8,17 +8,16 @@ import asyncio
 import exifread
 import os
 import tempfile
-import urllib.parse
 import json
 from typing import Optional, Tuple
 
 
 @register(
-    "astrbot_plugin_image_metadata",
+    "astrbot_plugin_img_analysis",
     "NightDust981989",
-    "一个用于解析图片元数据的插件（QQ平台专用）",
-    "4.0.0",
-    "https://github.com/xxx/astrbot_plugin_image_metadata"
+    "图片元数据解析插件",
+    "1.0.0",
+    "https://github.com/NightDust981989/astrbot_plugin_img_analysis"
 )
 class ImageMetadataPlugin(Star):
     def __init__(self, context: Context, config=None):
@@ -26,187 +25,227 @@ class ImageMetadataPlugin(Star):
         self.client: Optional[aiohttp.ClientSession] = None
         self.waiting_sessions = {}
         self.timeout_tasks = {}
+        self.metadata_settings = {}
         
-        # 加载配置（适配高德API密钥）
-        if config:
-            self.metadata_settings = config.get("metadata_settings", {})
-        else:
-            self.metadata_settings = getattr(self.context, '_config', {}).get("metadata_settings", {})
+        try:
+            if config and isinstance(config, dict):
+                self.metadata_settings = config.get("metadata_settings", {})
+            else:
+                self.metadata_settings = {
+                    "amap_api_key": "",
+                    "timeout_seconds": 30,
+                    "prompt_send_image": "请发送要解析的图片",
+                    "prompt_timeout": "解析请求已超时，请重新发送命令",
+                    "max_exif_show": 20
+                }
+        except Exception as e:
+            logger.error(f"加载配置失败，使用默认值: {str(e)}")
+            self.metadata_settings = {
+                "amap_api_key": "",
+                "timeout_seconds": 30,
+                "prompt_send_image": "请发送要解析的图片",
+                "prompt_timeout": "解析请求已超时，请重新发送命令",
+                "max_exif_show": 20
+            }
         
-        # 配置参数（替换为高德API相关）
-        self.amap_api_key = self.metadata_settings.get("amap_api_key", "")  # 高德API密钥
-        self.timeout_seconds = self.metadata_settings.get("timeout_seconds", 30)
-        self.prompt_send_image = self.metadata_settings.get("prompt_send_image", "📷 请发送要解析的图片（30秒内有效）")
-        self.prompt_timeout = self.metadata_settings.get("prompt_timeout", "⏰ 解析请求已超时，请重新发送命令")
-        self.max_exif_show = self.metadata_settings.get("max_exif_show", 20)
-        # 高德逆地理编码API地址
+        self.amap_api_key = self.metadata_settings.get("amap_api_key", "")
+        self.timeout_seconds = int(self.metadata_settings.get("timeout_seconds", 30))
+        self.prompt_send_image = self.metadata_settings.get("prompt_send_image", "请发送要解析的图片")
+        self.prompt_timeout = self.metadata_settings.get("prompt_timeout", "解析请求已超时，请重新发送命令")
+        self.max_exif_show = int(self.metadata_settings.get("max_exif_show", 20))
         self.amap_api_url = "https://restapi.amap.com/v3/geocode/regeo"
 
     async def initialize(self):
         """初始化HTTP客户端"""
-        connector = aiohttp.TCPConnector(ssl=False)
-        self.client = aiohttp.ClientSession(
-            connector=connector,
-            timeout=aiohttp.ClientTimeout(total=30)
-        )
-        logger.info("图片元数据解析插件已初始化（使用exifread解析GPS + 高德地图API）")
+        try:
+            connector = aiohttp.TCPConnector(ssl=False)
+            self.client = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=30)
+            )
+            logger.info("图片元数据解析插件初始化成功")
+        except Exception as e:
+            logger.error(f"初始化HTTP客户端失败: {str(e)}")
+            self.client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+
+    def _safe_get_exif_value(self, tag_value) -> str:
+        """安全获取Exif值，处理bytes类型和Tag对象"""
+        try:
+            # 如果是bytes类型，尝试解码为字符串
+            if isinstance(tag_value, bytes):
+                # 优先尝试UTF-8解码，失败则用GBK，最后返回十六进制
+                try:
+                    return tag_value.decode('utf-8', errors='ignore').strip()
+                except:
+                    try:
+                        return tag_value.decode('gbk', errors='ignore').strip()
+                    except:
+                        return f"[二进制数据] 长度: {len(tag_value)} bytes"
+            
+            # 如果是exifread的Tag对象，读取values属性
+            if hasattr(tag_value, 'values'):
+                # 处理values是列表的情况
+                if isinstance(tag_value.values, list):
+                    # 列表元素如果是bytes，解码后拼接
+                    values = []
+                    for v in tag_value.values:
+                        if isinstance(v, bytes):
+                            values.append(self._safe_get_exif_value(v))
+                        else:
+                            values.append(str(v))
+                    return ", ".join(values)
+                # 普通values值
+                return str(tag_value.values).strip()
+            
+            # 其他类型直接转字符串
+            return str(tag_value).strip()
+        except Exception as e:
+            logger.warning(f"解析Exif值失败: {str(e)}")
+            return f"[解析失败] {str(e)[:10]}"
 
     def _convert_exif_gps(self, gps_coords, ref) -> float:
-        """将Exif格式的GPS坐标转换为十进制（限制6位小数）"""
+        """GPS坐标转换为十进制（增加安全取值）"""
+        obj = 0.0
         try:
-            deg = float(gps_coords.values[0].num) / float(gps_coords.values[0].den)
-            min = float(gps_coords.values[1].num) / float(gps_coords.values[1].den)
-            sec = float(gps_coords.values[2].num) / float(gps_coords.values[2].den)
+            # 安全获取GPS度分秒值
+            deg_val = self._safe_get_exif_value(gps_coords.values[0])
+            min_val = self._safe_get_exif_value(gps_coords.values[1])
+            sec_val = self._safe_get_exif_value(gps_coords.values[2])
             
-            dd = deg + (min / 60.0) + (sec / 3600.0)
+            # 转换为浮点数
+            deg = float(deg_val) if deg_val.replace('.', '').isdigit() else 0.0
+            min_v = float(min_val) if min_val.replace('.', '').isdigit() else 0.0
+            sec_v = float(sec_val) if sec_val.replace('.', '').isdigit() else 0.0
+            
+            obj = deg + (min_v / 60.0) + (sec_v / 3600.0)
             if ref in ['S', 'W']:
-                dd = -dd
-            return round(dd, 6)
+                obj = -obj
+            obj = round(obj, 6)
         except Exception as e:
-            logger.warning(f"GPS坐标转换失败: {e}")
-            return 0.0
+            logger.warning(f"GPS坐标转换失败: {str(e)}")
+            obj = 0.0
+        return obj
 
     def _parse_gps_exifread(self, exif_tags) -> Tuple[Optional[float], Optional[float], str]:
-        """使用exifread解析GPS"""
+        """解析GPS信息（安全处理Tag对象）"""
+        lat = None
+        lon = None
+        gps_str = "无GPS信息"
         try:
             gps_lat = exif_tags.get('GPS GPSLatitude')
             gps_lat_ref = exif_tags.get('GPS GPSLatitudeRef')
             gps_lon = exif_tags.get('GPS GPSLongitude')
             gps_lon_ref = exif_tags.get('GPS GPSLongitudeRef')
 
-            if not all([gps_lat, gps_lat_ref, gps_lon, gps_lon_ref]):
-                logger.debug("Exif中缺失GPS字段")
-                return None, None, "无GPS信息"
-            
-            latitude = self._convert_exif_gps(gps_lat, gps_lat_ref.values)
-            longitude = self._convert_exif_gps(gps_lon, gps_lon_ref.values)
-
-            if latitude == 0.0 and longitude == 0.0:
-                return None, None, "GPS坐标无效（值为0）"
-
-            gps_str = f"纬度：{latitude}° {gps_lat_ref.values}，经度：{longitude}° {gps_lon_ref.values}"
-            return latitude, longitude, gps_str
+            # 检查是否都是有效的Tag对象
+            if all([
+                gps_lat and hasattr(gps_lat, 'values'),
+                gps_lat_ref and hasattr(gps_lat_ref, 'values'),
+                gps_lon and hasattr(gps_lon, 'values'),
+                gps_lon_ref and hasattr(gps_lon_ref, 'values')
+            ]):
+                # 安全获取参考值
+                lat_ref = self._safe_get_exif_value(gps_lat_ref.values)
+                lon_ref = self._safe_get_exif_value(gps_lon_ref.values)
+                
+                lat = self._convert_exif_gps(gps_lat, lat_ref)
+                lon = self._convert_exif_gps(gps_lon, lon_ref)
+                
+                if lat == 0.0 and lon == 0.0:
+                    gps_str = "GPS坐标无效（值为0）"
+                else:
+                    gps_str = f"纬度：{lat}° {lat_ref}，经度：{lon}° {lon_ref}"
+            else:
+                gps_str = "无GPS信息"
         except Exception as e:
-            logger.error(f"解析GPS失败: {e}")
-            return None, None, f"GPS解析异常: {str(e)[:20]}..."
+            logger.error(f"解析GPS失败: {str(e)}")
+            gps_str = f"GPS解析异常: {str(e)[:20]}..."
+        return lat, lon, gps_str
 
     async def _gps_to_address(self, lat: float, lon: float) -> str:
-        """高德地图逆地理编码API调用（替换天地图）"""
+        """高德地图逆地理编码"""
         if not self.amap_api_key:
-            return "❌ 未配置高德地图API Key\n请前往 https://lbs.amap.com/ 申请Web服务API密钥，并在配置文件中设置 amap_api_key"
+            return "未配置高德地图API Key\n请前往https://lbs.amap.com/申请Web服务API密钥，并在配置文件中设置 amap_api_key"
 
-        # 基础参数校验
         if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-            return f"❌ GPS坐标无效\n纬度范围需为[-90,90]，经度范围需为[-180,180]，当前：纬度{lat}，经度{lon}"
+            return f"GPS坐标无效\n纬度范围需为[-90,90]，经度范围需为[-180,180]，当前：纬度{lat}，经度{lon}"
 
+        resp_str = ""
         try:
-            # 高德API参数构建（经纬度格式：lon,lat）
             params = {
-                "location": f"{lon},{lat}",  # 高德要求 经度,纬度 顺序
+                "location": f"{lon},{lat}",
                 "key": self.amap_api_key,
-                "extensions": "all",  # 返回详细地址信息
+                "extensions": "all",
                 "output": "json",
                 "radius": 1000
             }
-            
-            # 打印调试信息
-            logger.debug(f"高德API请求参数: {params}")
-            
-            # 发送GET请求
+
             async with self.client.get(
                 self.amap_api_url,
                 params=params,
-                timeout=aiohttp.ClientTimeout(total=10),
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Accept": "application/json"
-                }
+                timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
-                logger.debug(f"高德API响应状态码: {resp.status}")
                 response_text = await resp.text()
-                logger.debug(f"高德API原始响应: {response_text[:500]}")
-                
+                logger.debug(f"高德API响应: {response_text[:500]}")
                 resp.raise_for_status()
-                data = json.loads(response_text)
+                obj = json.loads(response_text)
 
-            # 解析高德API响应
-            if data.get("status") == "1":  # 高德API成功状态码为"1"
-                regeo_data = data.get("regeocode", {})
-                # 提取详细地址
-                formatted_address = regeo_data.get("formatted_address", "")
-                if formatted_address:
-                    address_str = f"📍 解析地址：{formatted_address}"
+            if obj.get("status") == "1":
+                regeo = obj.get("regeocode", {})
+                formatted_addr = regeo.get("formatted_address", "")
+                if formatted_addr:
+                    resp_str = f"解析地址：{formatted_addr}"
                 else:
-                    # 分级提取地址
-                    address_component = regeo_data.get("addressComponent", {})
-                    province = address_component.get("province", "")
-                    city = address_component.get("city", "")
-                    district = address_component.get("district", "")
-                    township = address_component.get("township", "")
-                    street = address_component.get("streetNumber", {}).get("street", "")
-                    number = address_component.get("streetNumber", {}).get("number", "")
-                    
-                    address_parts = [p for p in [province, city, district, township, street, number] if p]
-                    if address_parts:
-                        address_str = f"📍 解析地址：{' '.join(address_parts)}"
-                    else:
-                        address_str = "📍 解析地址：未匹配到详细地址"
-                
-                # 补充兴趣点信息（可选）
-                pois = regeo_data.get("pois", [])
-                if pois and len(pois) > 0:
-                    address_str += f"\n📌 附近兴趣点：{pois[0].get('name', '')}（{pois[0].get('type', '')}）"
-                
-                return address_str
+                    addr_comp = regeo.get("addressComponent", {})
+                    province = addr_comp.get("province", "")
+                    city = addr_comp.get("city", "")
+                    district = addr_comp.get("district", "")
+                    street = addr_comp.get("streetNumber", {}).get("street", "")
+                    number = addr_comp.get("streetNumber", {}).get("number", "")
+                    addr_parts = [p for p in [province, city, district, street, number] if p]
+                    resp_str = "解析地址：" + " ".join(addr_parts) if addr_parts else "解析地址：未匹配到详细地址"
             else:
-                error_info = data.get("info", "未知错误")
-                error_code = data.get("infocode", "未知码")
-                return f"❌ 地址解析失败\n错误码：{error_code}\n错误信息：{error_info}"
-
-        except aiohttp.ClientError as e:
-            logger.error(f"高德API网络错误: {str(e)}")
-            return f"❌ 地址解析失败（网络错误）\n{str(e)[:30]}...\n请检查网络或稍后重试"
+                resp_str = f"地址解析失败\n错误码：{obj.get('infocode', '未知')}\n错误信息：{obj.get('info', '未知')}"
         except asyncio.TimeoutError:
-            return "❌ 地址解析超时（高德API响应超过10秒）"
-        except json.JSONDecodeError as e:
-            logger.error(f"高德API响应JSON解析失败: {str(e)} | 响应: {response_text[:100]}")
-            return f"❌ 地址解析失败（响应格式错误）\n{str(e)[:30]}..."
+            resp_str = "地址解析超时（高德API响应超过10秒）"
         except Exception as e:
-            logger.error(f"高德API调用未知错误: {str(e)}")
-            return f"❌ 地址解析失败（未知错误）\n{str(e)[:30]}..."
+            resp_str = f"地址解析失败（未知错误）\n{str(e)[:30]}..."
+        return resp_str
 
     def _parse_image_meta(self, image_path: str) -> dict:
-        """使用exifread解析完整Exif数据"""
+        """解析图片元数据（核心修复bytes属性错误）"""
         result = {
             "basic": {},
             "exif": {},
             "gps": {"lat": None, "lon": None, "str": "无GPS信息"},
             "error": None
         }
-
         try:
             # 基础文件信息
             file_size = os.path.getsize(image_path)
             result["basic"]["文件大小(KB)"] = round(file_size / 1024, 2)
             result["basic"]["文件大小(MB)"] = round(file_size / 1024 / 1024, 2)
 
-            # 解析Exif
+            # 解析Exif（禁用详细模式，减少二进制数据）
             with open(image_path, 'rb') as f:
-                exif_tags = exifread.process_file(f, details=False)
-            
-            # 提取基础图片信息
-            if exif_tags.get('Image ImageWidth'):
-                result["basic"]["宽度"] = f"{exif_tags['Image ImageWidth'].values} 像素"
-            if exif_tags.get('Image ImageLength'):
-                result["basic"]["高度"] = f"{exif_tags['Image ImageLength'].values} 像素"
-            if exif_tags.get('Image FileType'):
-                result["basic"]["格式"] = exif_tags['Image FileType'].values
-            if exif_tags.get('Image Make'):
-                result["basic"]["设备厂商"] = exif_tags['Image Make'].values
-            if exif_tags.get('Image Model'):
-                result["basic"]["设备型号"] = exif_tags['Image Model'].values
-            if exif_tags.get('Image DateTime'):
-                result["basic"]["拍摄时间"] = exif_tags['Image DateTime'].values
+                exif_tags = exifread.process_file(f, details=False, stop_tag='GPS')
+
+            # 提取基础图片信息（安全取值）
+            if 'Image ImageWidth' in exif_tags:
+                width_val = self._safe_get_exif_value(exif_tags['Image ImageWidth'])
+                result["basic"]["宽度"] = f"{width_val} 像素"
+            if 'Image ImageLength' in exif_tags:
+                height_val = self._safe_get_exif_value(exif_tags['Image ImageLength'])
+                result["basic"]["高度"] = f"{height_val} 像素"
+            if 'Image Make' in exif_tags:
+                make_val = self._safe_get_exif_value(exif_tags['Image Make'])
+                result["basic"]["设备厂商"] = make_val
+            if 'Image Model' in exif_tags:
+                model_val = self._safe_get_exif_value(exif_tags['Image Model'])
+                result["basic"]["设备型号"] = model_val
+            if 'Image DateTime' in exif_tags:
+                dt_val = self._safe_get_exif_value(exif_tags['Image DateTime'])
+                result["basic"]["拍摄时间"] = dt_val
 
             # 解析GPS
             lat, lon, gps_str = self._parse_gps_exifread(exif_tags)
@@ -214,71 +253,68 @@ class ImageMetadataPlugin(Star):
             result["gps"]["lon"] = lon
             result["gps"]["str"] = gps_str
 
-            # 提取其他Exif字段
+            # 提取其他Exif字段（过滤二进制数据，安全取值）
             exif_dict = {}
             for tag, value in exif_tags.items():
-                if not tag.startswith('GPS') and not isinstance(value.values, bytes):
-                    exif_dict[tag.replace(' ', '_')] = str(value.values)
+                # 跳过GPS相关（已单独解析）
+                if tag.startswith('GPS'):
+                    continue
+                
+                # 安全获取值，避免bytes错误
+                val_str = self._safe_get_exif_value(value)
+                
+                # 过滤空值和过长的值
+                if val_str and val_str != "None" and len(val_str) < 200:
+                    exif_dict[tag.replace(' ', '_')] = val_str
             
             result["exif"] = exif_dict
-
         except Exception as e:
             result["error"] = str(e)[:80]
-            logger.error(f"解析元数据失败: {e}")
-
+            logger.error(f"解析元数据失败: {str(e)}")
         return result
 
     async def _download_image(self, image_url: str) -> Optional[str]:
         """下载图片到临时文件"""
+        temp_path = None
         try:
-            logger.debug(f"下载图片: {image_url[:100]}...")
-            async with self.client.get(image_url) as response:
-                if response.status != 200:
-                    raise Exception(f"图片下载失败: HTTP {response.status}")
-                img_data = await response.read()
+            async with self.client.get(image_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP状态码错误: {resp.status}")
+                img_data = await resp.read()
 
             temp_file = tempfile.NamedTemporaryFile(suffix=".tmp", delete=False, encoding=None)
             temp_file.write(img_data)
             temp_file.close()
-            return temp_file.name
-        except asyncio.TimeoutError:
-            logger.error("图片下载超时")
-            return None
+            temp_path = temp_file.name
         except Exception as e:
-            logger.error(f"下载图片失败: {e}")
-            return None
+            logger.error(f"下载图片失败: {str(e)}")
+        return temp_path
 
-    async def extract_image_from_event(self, event: AstrMessageEvent) -> str:
-        """提取QQ消息中的图片URL"""
-        messages = event.get_messages()
-
-        # 1. 处理当前消息中的图片
-        for msg in messages:
-            if isinstance(msg, MsgImage):
-                if hasattr(msg, "url") and msg.url:
-                    return msg.url.strip()
-
-        # 2. 处理引用消息中的图片
+    async def extract_image_from_event(self, event: AstrMessageEvent) -> Optional[str]:
+        """提取消息中的图片URL"""
+        img_url = None
         try:
-            for msg in messages:
-                if isinstance(msg, Reply):
-                    if hasattr(msg, "chain") and msg.chain:
+            for msg in event.get_messages():
+                if isinstance(msg, MsgImage) and hasattr(msg, "url") and msg.url:
+                    img_url = msg.url.strip()
+                    break
+            if not img_url:
+                for msg in event.get_messages():
+                    if isinstance(msg, Reply) and hasattr(msg, "chain"):
                         for reply_msg in msg.chain:
                             if isinstance(reply_msg, MsgImage) and hasattr(reply_msg, "url") and reply_msg.url:
-                                return reply_msg.url.strip()
+                                img_url = reply_msg.url.strip()
+                                break
         except Exception as e:
-            logger.warning(f"检查引用消息图片时出错: {e}")
-
-        return None
+            logger.warning(f"提取图片URL失败: {str(e)}")
+        return img_url
 
     async def process_metadata_analysis(self, event: AstrMessageEvent, image_path: str):
-        """处理元数据解析并发送结果"""
+        """处理解析结果并发送"""
         try:
             meta = self._parse_image_meta(image_path)
-
-            # 构建消息链
             chain = []
-            
+
             # 基础信息
             basic_lines = ["【基础信息】"]
             for k, v in meta["basic"].items():
@@ -289,8 +325,8 @@ class ImageMetadataPlugin(Star):
             # GPS信息
             gps_lines = ["【GPS信息】", meta["gps"]["str"]]
             if meta["gps"]["lat"] and meta["gps"]["lon"]:
-                address_str = await self._gps_to_address(meta["gps"]["lat"], meta["gps"]["lon"])
-                gps_lines.append(address_str)
+                addr_str = await self._gps_to_address(meta["gps"]["lat"], meta["gps"]["lon"])
+                gps_lines.append(addr_str)
             chain.append(Comp.Plain("\n".join(gps_lines)))
             chain.append(Comp.Plain("\n"))
 
@@ -304,125 +340,123 @@ class ImageMetadataPlugin(Star):
                 if len(meta["exif"]) > self.max_exif_show:
                     exif_lines.append(f"（共{len(meta['exif'])}个字段，仅展示前{self.max_exif_show}个）")
             else:
-                exif_lines.append("无Exif详细数据")
+                exif_lines.append("无")
             chain.append(Comp.Plain("\n".join(exif_lines)))
+            chain.append(Comp.Plain("\n"))
 
             # 错误信息
             if meta["error"]:
-                chain.append(Comp.Plain(f"\n【解析提示】{meta['error']}"))
+                chain.append(Comp.Plain(f"【解析提示】\n{meta['error']}"))
 
             await event.send(event.chain_result(chain))
-
         except Exception as e:
-            logger.error(f"处理解析结果失败: {e}")
-            await event.send(event.plain_result(f"❌ 解析结果处理失败: {str(e)[:50]}..."))
+            logger.error(f"处理解析结果失败: {str(e)}")
+            await event.send(event.plain_result(f"解析失败: {str(e)[:50]}..."))
 
-    @filter.command("imgmeta", "图片元数据", "解析图片元数据")
+    @filter.command("imgmeta", "图片元数据", "解析")
     async def imgmeta_handler(self, event: AstrMessageEvent, args=None):
-        """主指令处理器"""
-        user_id = event.get_sender_id()
+        """主指令"""
+        # 兼容不同版本的用户ID获取方式
+        try:
+            user_id = event.get_sender_id()
+        except:
+            user_id = str(event.user_id) if hasattr(event, 'user_id') else str(id(event))
+        
+        img_url = await self.extract_image_from_event(event)
 
-        # 检查当前消息是否包含图片
-        image_url = await self.extract_image_from_event(event)
-        if image_url:
-            temp_file = await self._download_image(image_url)
-            if temp_file:
-                await self.process_metadata_analysis(event, temp_file)
-                # 清理临时文件
+        if img_url:
+            temp_path = await self._download_image(img_url)
+            if temp_path:
+                await self.process_metadata_analysis(event, temp_path)
                 try:
-                    os.unlink(temp_file)
+                    os.unlink(temp_path)
                 except:
                     pass
             else:
-                await event.send(event.plain_result("❌ 图片下载失败，请重试"))
+                await event.send(event.plain_result("图片下载失败"))
             return
 
-        # 检查引用消息无图片的情况
-        try:
-            raw_event = event._event if hasattr(event, "_event") else event
-            if hasattr(raw_event, "reply_to_message") and raw_event.reply_to_message:
-                await event.send(event.plain_result("❌ 引用消息中没有找到图片，请确保引用的消息包含图片"))
-                return
-        except Exception as e:
-            logger.warning(f"检查引用消息状态时出错: {e}")
-
-        # 设置等待状态
+        # 等待用户发送图片
         self.waiting_sessions[user_id] = {
             "timestamp": asyncio.get_event_loop().time(),
-            "event": event,
+            "event": event
         }
-
-        # 创建超时任务
         if user_id in self.timeout_tasks:
             self.timeout_tasks[user_id].cancel()
-
-        timeout_task = asyncio.create_task(self.timeout_check(user_id))
-        self.timeout_tasks[user_id] = timeout_task
-
+        self.timeout_tasks[user_id] = asyncio.create_task(self.timeout_check(user_id))
         await event.send(event.plain_result(self.prompt_send_image))
-        logger.debug(f"QQ用户 {user_id} 进入等待图片状态，等待{self.timeout_seconds}秒")
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        """监听消息，处理等待中的图片解析请求"""
-        user_id = event.get_sender_id()
-
+        """监听消息"""
+        try:
+            user_id = event.get_sender_id()
+        except:
+            user_id = str(event.user_id) if hasattr(event, 'user_id') else str(id(event))
+            
         if user_id not in self.waiting_sessions:
             return
 
-        session = self.waiting_sessions[user_id]
+        session = self.waiting_sessions.get(user_id)
+        if not session:
+            return
 
         # 检查超时
-        current_time = asyncio.get_event_loop().time()
-        if current_time - session["timestamp"] > self.timeout_seconds:
+        if asyncio.get_event_loop().time() - session["timestamp"] > self.timeout_seconds:
             return
 
-        # 提取图片
-        image_url = await self.extract_image_from_event(event)
-        if not image_url:
+        img_url = await self.extract_image_from_event(event)
+        if not img_url:
             return
 
-        # 开始解析
+        # 清理等待状态
         del self.waiting_sessions[user_id]
         if user_id in self.timeout_tasks:
             self.timeout_tasks[user_id].cancel()
             del self.timeout_tasks[user_id]
 
-        temp_file = await self._download_image(image_url)
-        if temp_file:
-            await self.process_metadata_analysis(event, temp_file)
+        # 解析图片
+        temp_path = await self._download_image(img_url)
+        if temp_path:
+            await self.process_metadata_analysis(event, temp_path)
             try:
-                os.unlink(temp_file)
+                os.unlink(temp_path)
             except:
                 pass
         else:
-            await event.send(event.plain_result("❌ 图片下载失败，请重试"))
+            await event.send(event.plain_result("图片下载失败"))
 
     async def timeout_check(self, user_id: str):
         """超时检查"""
         try:
             await asyncio.sleep(self.timeout_seconds)
             if user_id in self.waiting_sessions:
-                session = self.waiting_sessions[user_id]
-                event = session["event"]
+                event = self.waiting_sessions[user_id]["event"]
                 del self.waiting_sessions[user_id]
-                del self.timeout_tasks[user_id]
-                try:
-                    await event.send(event.plain_result(self.prompt_timeout))
-                    logger.debug(f"QQ用户 {user_id} 的图片解析请求已超时")
-                except Exception as send_error:
-                    logger.warning(f"发送超时消息失败: {send_error}")
+                if user_id in self.timeout_tasks:
+                    del self.timeout_tasks[user_id]
+                await event.send(event.plain_result(self.prompt_timeout))
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error(f"超时检查任务异常: {e}")
+            logger.error(f"超时检查失败: {str(e)}")
 
     async def terminate(self):
         """插件销毁"""
-        if self.client and not self.client.closed:
-            await self.client.close()
+        try:
+            if self.client and not self.client.closed:
+                await self.client.close()
+        except:
+            pass
         for task in self.timeout_tasks.values():
-            task.cancel()
-        self.timeout_tasks.clear()
+            try:
+                task.cancel()
+            except:
+                pass
         self.waiting_sessions.clear()
-        logger.info("图片元数据解析插件已优雅销毁（QQ平台 + 高德地图API）")
+        self.timeout_tasks.clear()
+        logger.info("图片元数据解析插件已优雅销毁")
+
+
+def setup(context: Context):
+    return ImageMetadataPlugin(context)
