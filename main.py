@@ -127,7 +127,7 @@ class ImageMetadataPlugin(Star):
         return obj
 
     def _parse_gps_exifread(self, exif_tags) -> Tuple[Optional[float], Optional[float], str]:
-        """解析GPS信息（安全处理Tag对象）"""
+        """解析GPS信息（处理Tag对象）"""
         lat = None
         lon = None
         gps_str = "无GPS信息"
@@ -342,11 +342,10 @@ class ImageMetadataPlugin(Star):
             else:
                 exif_lines.append("无")
             chain.append(Comp.Plain("\n".join(exif_lines)))
-            chain.append(Comp.Plain("\n"))
 
             # 错误信息
             if meta["error"]:
-                chain.append(Comp.Plain(f"【解析提示】\n{meta['error']}"))
+                chain.append(Comp.Plain(f"\n【解析提示】\n{meta['error']}"))
 
             await event.send(event.chain_result(chain))
         except Exception as e:

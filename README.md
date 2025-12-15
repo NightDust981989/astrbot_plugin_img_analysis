@@ -108,3 +108,7 @@ astrbot_plugin_img_analysis/
 - 本插件仅用于解析图片元数据，请勿用于非法用途
 - GPS 地址解析依赖高德地图 API，需遵守高德开放平台使用规范
 - 插件仅读取图片的 Exif 信息，不会上传/存储图片内容
+
+## 感谢
+- 高德地图 API
+- Whisky-Jay
