@@ -10,6 +10,11 @@ import os
 import tempfile
 import json
 from typing import Optional, Tuple
+# 添加XMP处理库
+try:
+    from lxml import etree
+except ImportError:
+    etree = None
 
 
 @register(
@@ -162,6 +167,125 @@ class ImageMetadataPlugin(Star):
             gps_str = f"GPS解析异常: {str(e)[:20]}..."
         return lat, lon, gps_str
 
+    def _extract_xmp_data(self, image_path: str) -> dict:
+        """提取XMP元数据"""
+        xmp_data = {}
+        try:
+            if not etree:
+                return {"error": "缺少lxml库，无法解析XMP数据"}
+                
+            with open(image_path, 'rb') as f:
+                data = f.read()
+            
+            # 查找XMP数据块
+            xmp_start = data.find(b'<x:xmpmeta')
+            if xmp_start == -1:
+                xmp_start = data.find(b'<rdf:RDF')
+            if xmp_start == -1:
+                xmp_start = data.find(b'<xmpmeta')
+            
+            if xmp_start != -1:
+                # 找到结束标签
+                xmp_end = data.find(b'</x:xmpmeta>', xmp_start)
+                if xmp_end == -1:
+                    xmp_end = data.find(b'</rdf:RDF>', xmp_start)
+                if xmp_end != -1:
+                    xmp_end += len(b'</x:xmpmeta>') if b'</x:xmpmeta>' in data[xmp_start:xmp_end+20] else len(b'</rdf:RDF>')
+                    xmp_content = data[xmp_start:xmp_end]
+                    
+                    # 解析XML
+                    parser = etree.XMLParser(recover=True)
+                    root = etree.fromstring(xmp_content, parser=parser)
+                    
+                    # 定义常用的XMP命名空间
+                    namespaces = {
+                        'dc': 'http://purl.org/dc/elements/1.1/',
+                        'xmp': 'http://ns.adobe.com/xap/1.0/',
+                        'xmpRights': 'http://ns.adobe.com/xap/1.0/rights/',
+                        'xmpMM': 'http://ns.adobe.com/xap/1.0/mm/',
+                        'photoshop': 'http://ns.adobe.com/photoshop/1.0/',
+                        'tiff': 'http://ns.adobe.com/tiff/1.0/',
+                        'iptc': 'http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/',
+                        'crs': 'http://ns.adobe.com/camera-raw-settings/1.0/',
+                        'aux': 'http://ns.adobe.com/exif/1.0/aux/'
+                    }
+                    
+                    # 提取常见的XMP字段
+                    # 标题和描述
+                    title = root.find('.//dc:title/rdf:Alt/rdf:li', namespaces)
+                    if title is not None:
+                        xmp_data['标题'] = title.text
+                        
+                    desc = root.find('.//dc:description/rdf:Alt/rdf:li', namespaces)
+                    if desc is not None:
+                        xmp_data['描述'] = desc.text
+                    
+                    # 关键词
+                    keywords = root.find('.//dc:subject/rdf:Bag', namespaces)
+                    if keywords is not None:
+                        keyword_list = []
+                        for li in keywords.findall('rdf:li', namespaces):
+                            if li.text:
+                                keyword_list.append(li.text)
+                        if keyword_list:
+                            xmp_data['关键词'] = ', '.join(keyword_list)
+                    
+                    # 作者和创作者
+                    creator = root.find('.//dc:creator/rdf:Seq/rdf:li', namespaces)
+                    if creator is not None:
+                        xmp_data['创作者'] = creator.text
+                    
+                    # 版权信息
+                    rights = root.xpath('//xmpRights:Marked | //xmpRights:UsageTerms/rdf:Alt/rdf:li', namespaces)
+                    for right in rights:
+                        if right.tag.endswith('Marked'):
+                            xmp_data['版权标记'] = '是' if right.text and right.text.lower() in ['true', 'yes'] else '否'
+                        elif right.tag.endswith('UsageTerms'):
+                            xmp_data['使用条款'] = right.text
+                    
+                    # 创建时间
+                    create_date = root.find('.//xmp:CreateDate', namespaces)
+                    if create_date is not None:
+                        xmp_data['创建日期'] = create_date.text
+                    
+                    # 修改时间
+                    mod_date = root.find('.//xmp:ModifyDate', namespaces)
+                    if mod_date is not None:
+                        xmp_data['修改日期'] = mod_date.text
+                    
+                    # 创建者工具
+                    creator_tool = root.find('.//xmp:CreatorTool', namespaces)
+                    if creator_tool is not None:
+                        xmp_data['创建工具'] = creator_tool.text
+                    
+                    # 相机原始设置（如果存在）
+                    lens_model = root.find('.//aux:Lens', namespaces)
+                    if lens_model is not None:
+                        xmp_data['镜头型号'] = lens_model.text
+                    
+                    serial_number = root.find('.//aux:SerialNumber', namespaces)
+                    if serial_number is not None:
+                        xmp_data['序列号'] = serial_number.text
+                    
+                    # IPTC信息
+                    city = root.find('.//photoshop:City', namespaces)
+                    if city is not None:
+                        xmp_data['城市'] = city.text
+                    
+                    state = root.find('.//photoshop:State', namespaces)
+                    if state is not None:
+                        xmp_data['州/省'] = state.text
+                    
+                    country = root.find('.//photoshop:Country', namespaces)
+                    if country is not None:
+                        xmp_data['国家'] = country.text
+            
+        except Exception as e:
+            logger.warning(f"解析XMP数据失败: {str(e)}")
+            xmp_data['error'] = f"XMP解析错误: {str(e)}"
+        
+        return xmp_data
+
     async def _gps_to_address(self, lat: float, lon: float) -> str:
         """高德地图逆地理编码"""
         if not self.amap_api_key:
@@ -216,6 +340,8 @@ class ImageMetadataPlugin(Star):
         """解析图片元数据（核心修复bytes属性错误）"""
         result = {
             "basic": {},
+            "camera": {},  # 新增相机参数信息
+            "xmp": {},     # 新增XMP数据
             "exif": {},
             "gps": {"lat": None, "lon": None, "str": "无GPS信息"},
             "error": None
@@ -225,6 +351,10 @@ class ImageMetadataPlugin(Star):
             file_size = os.path.getsize(image_path)
             result["basic"]["文件大小(KB)"] = round(file_size / 1024, 2)
             result["basic"]["文件大小(MB)"] = round(file_size / 1024 / 1024, 2)
+
+            # 获取文件扩展名和类型
+            _, file_ext = os.path.splitext(image_path)
+            result["basic"]["文件格式"] = file_ext.upper()[1:] if file_ext else "未知"
 
             # 解析Exif（禁用详细模式，减少二进制数据）
             with open(image_path, 'rb') as f:
@@ -247,17 +377,66 @@ class ImageMetadataPlugin(Star):
                 dt_val = self._safe_get_exif_value(exif_tags['Image DateTime'])
                 result["basic"]["拍摄时间"] = dt_val
 
+            # 提取相机参数信息
+            if 'EXIF FNumber' in exif_tags:
+                fnum_val = self._safe_get_exif_value(exif_tags['EXIF FNumber'])
+                result["camera"]["光圈值"] = f"f/{fnum_val}"
+            if 'EXIF ExposureTime' in exif_tags:
+                exp_time_val = self._safe_get_exif_value(exif_tags['EXIF ExposureTime'])
+                result["camera"]["快门速度"] = f"1/{exp_time_val}s" if '/' in exp_time_val else f"{exp_time_val}s"
+            if 'EXIF ISOSpeedRatings' in exif_tags:
+                iso_val = self._safe_get_exif_value(exif_tags['EXIF ISOSpeedRatings'])
+                result["camera"]["ISO感光度"] = iso_val
+            if 'EXIF FocalLength' in exif_tags:
+                focal_val = self._safe_get_exif_value(exif_tags['EXIF FocalLength'])
+                result["camera"]["焦距"] = f"{focal_val}mm"
+            if 'EXIF Flash' in exif_tags:
+                flash_val = self._safe_get_exif_value(exif_tags['EXIF Flash'])
+                result["camera"]["闪光灯"] = "有" if flash_val != "0" else "无"
+            if 'EXIF WhiteBalance' in exif_tags:
+                wb_val = self._safe_get_exif_value(exif_tags['EXIF WhiteBalance'])
+                result["camera"]["白平衡"] = "手动" if wb_val == "1" else "自动"
+            if 'EXIF MeteringMode' in exif_tags:
+                metering_val = self._safe_get_exif_value(exif_tags['EXIF MeteringMode'])
+                metering_modes = {
+                    "0": "未知", "1": "平均测光", "2": "中央重点平均测光", 
+                    "3": "点测光", "4": "多点测光", "5": "图案测光", 
+                    "6": "局部测光", "255": "其他"
+                }
+                result["camera"]["测光模式"] = metering_modes.get(metering_val, "未知")
+
+            # 提取版权和作者信息
+            if 'Image Artist' in exif_tags:
+                artist_val = self._safe_get_exif_value(exif_tags['Image Artist'])
+                result["exif"]["作者"] = artist_val
+            if 'Image Copyright' in exif_tags:
+                copyright_val = self._safe_get_exif_value(exif_tags['Image Copyright'])
+                result["exif"]["版权"] = copyright_val
+            if 'Image Software' in exif_tags:
+                software_val = self._safe_get_exif_value(exif_tags['Image Software'])
+                result["exif"]["编辑软件"] = software_val
+
             # 解析GPS
             lat, lon, gps_str = self._parse_gps_exifread(exif_tags)
             result["gps"]["lat"] = lat
             result["gps"]["lon"] = lon
             result["gps"]["str"] = gps_str
 
+            # 解析XMP数据
+            result["xmp"] = self._extract_xmp_data(image_path)
+
             # 提取其他Exif字段（过滤二进制数据，安全取值）
             exif_dict = {}
             for tag, value in exif_tags.items():
-                # 跳过GPS相关（已单独解析）
-                if tag.startswith('GPS'):
+                # 跳过GPS相关（已单独解析）和已处理的基础信息
+                if tag.startswith('GPS') or tag in [
+                    'Image ImageWidth', 'Image ImageLength', 'Image Make', 
+                    'Image Model', 'Image DateTime', 'EXIF FNumber', 
+                    'EXIF ExposureTime', 'EXIF ISOSpeedRatings', 
+                    'EXIF FocalLength', 'EXIF Flash', 'EXIF WhiteBalance',
+                    'EXIF MeteringMode', 'Image Artist', 'Image Copyright', 
+                    'Image Software'
+                ]:
                     continue
                 
                 # 安全获取值，避免bytes错误
@@ -267,7 +446,7 @@ class ImageMetadataPlugin(Star):
                 if val_str and val_str != "None" and len(val_str) < 200:
                     exif_dict[tag.replace(' ', '_')] = val_str
             
-            result["exif"] = exif_dict
+            result["exif"].update(exif_dict)
         except Exception as e:
             result["error"] = str(e)[:80]
             logger.error(f"解析元数据失败: {str(e)}")
@@ -320,7 +499,15 @@ class ImageMetadataPlugin(Star):
             for k, v in meta["basic"].items():
                 basic_lines.append(f"{k}：{v}")
             chain.append(Comp.Plain("\n".join(basic_lines)))
-            chain.append(Comp.Plain("\n"))
+            chain.append(Comp.Plain("‎\n‎"))
+
+            # 相机参数信息
+            if meta["camera"]:  # 只有存在相机参数时才显示
+                camera_lines = ["【相机参数】"]
+                for k, v in meta["camera"].items():
+                    camera_lines.append(f"{k}：{v}")
+                chain.append(Comp.Plain("\n".join(camera_lines)))
+                chain.append(Comp.Plain("‎\n‎"))
 
             # GPS信息
             gps_lines = ["【GPS信息】", meta["gps"]["str"]]
@@ -328,7 +515,17 @@ class ImageMetadataPlugin(Star):
                 addr_str = await self._gps_to_address(meta["gps"]["lat"], meta["gps"]["lon"])
                 gps_lines.append(addr_str)
             chain.append(Comp.Plain("\n".join(gps_lines)))
-            chain.append(Comp.Plain("\n"))
+            chain.append(Comp.Plain("‎\n‎"))
+
+            # XMP信息
+            if meta["xmp"] and not meta["xmp"].get("error"):  # 只有存在XMP数据且无错误时才显示
+                xmp_lines = ["【XMP元数据】"]
+                for k, v in meta["xmp"].items():
+                    xmp_lines.append(f"{k}：{v}")
+                chain.append(Comp.Plain("\n".join(xmp_lines)))
+                chain.append(Comp.Plain("‎\n‎"))
+            elif meta["xmp"] and meta["xmp"].get("error"):
+                chain.append(Comp.Plain(f"【XMP解析错误】\n{meta['xmp']['error']}\n"))
 
             # Exif信息
             exif_lines = ["【Exif详细数据】"]
