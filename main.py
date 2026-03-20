@@ -56,7 +56,7 @@ def check_and_install_exiftool():
     "astrbot_plugin_img_analysis",
     "NightDust981989",
     "图片元数据解析插件",
-    "1.0.0",
+    "2.0.0",
     "https://github.com/NightDust981989/astrbot_plugin_img_analysis"
 )
 class ImageMetadataPlugin(Star):
@@ -98,7 +98,11 @@ class ImageMetadataPlugin(Star):
     async def initialize(self):
         """初始化HTTP客户端"""
         try:
-            self.client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+            connector = aiohttp.TCPConnector(ssl=False)
+            self.client = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=30)
+            )
             logger.info("图片元数据解析插件初始化成功")
             
             # 在初始化时检查并安装exiftool
@@ -121,6 +125,7 @@ class ImageMetadataPlugin(Star):
                 '-a',  # 显示重复的标签
                 '-u',  # 显示未知标签
                 '-g',  # 按组分组
+                '-n',
                 image_path
             ], capture_output=True, text=True, timeout=30)
             
@@ -130,15 +135,8 @@ class ImageMetadataPlugin(Star):
             
             import json
             data = json.loads(result.stdout)[0]  # 返回数组，取第一个元素
-
-            # 过滤并整理数据
-            filtered_data = {}
-            for key, value in data.items():
-                # 跳过一些内部标签
-                if key not in ['SourceFile', 'ExifTool:ExifToolVersion']:
-                    filtered_data[key] = str(value)
-            
-            return filtered_data
+            return data
+        
         except subprocess.TimeoutExpired:
             logger.error("exiftool执行超时")
             return {"error": "exiftool执行超时"}
@@ -165,194 +163,108 @@ class ImageMetadataPlugin(Star):
             
             if exiftool_data and not exiftool_data.get("error"):
                 # 从数据中提取各类信息
-                for key, value in exiftool_data.items():
-                    # 基础信息
-                    if ':' in key:
-                        group, field = key.split(':', 1)
+                data = exiftool_data
+                File = data.get("File", {})
+                EXIF = data.get("EXIF", {})
+                GPS = data.get("GPS", {})
+                Composite = data.get("Composite", {})
                         
-                        # 文件基本信息
-                        if group == 'File':
-                            if field == 'FileName':
-                                result["basic"]["文件名"] = value
-                            elif field == 'FileSize':
-                                result["basic"]["文件大小"] = value
-                            elif field == 'FileType':
-                                result["basic"]["文件格式"] = value
-                            elif field == 'ImageWidth':
-                                result["basic"]["宽度"] = f"{value} 像素"
-                            elif field == 'ImageHeight':
-                                result["basic"]["高度"] = f"{value} 像素"
-                            elif field == 'MIMEType':
-                                result["basic"]["MIME类型"] = value
-                            elif field == 'ModifyDate':
-                                result["basic"]["修改时间"] = value
+                # 文件基本信息
+                if File.get("FileSize"):
+                    result["basic"]["文件大小"] = File["FileSize"]
+                if File.get("FileType"):
+                    result["basic"]["文件格式"] = File["FileType"]
+                if File.get("ImageWidth"):
+                    result["basic"]["宽度"] = f"{File['ImageWidth']} 像素"
+                if File.get("ImageHeight"):
+                    result["basic"]["高度"] = f"{File['ImageHeight']} 像素"
+                if File.get("MIMEType"):
+                    result["basic"]["MIME类型"] = File["MIMEType"]
+                if File.get("ModifyDate"):
+                    result["basic"]["修改时间"] = File["ModifyDate"]
                         
-                        # EXIF信息
-                        elif group == 'EXIF':
-                            # 基本信息
-                            if field == 'Make':
-                                result["basic"]["设备厂商"] = value
-                            elif field == 'Model':
-                                result["basic"]["设备型号"] = value
-                            elif field == 'DateTimeOriginal':
-                                result["basic"]["拍摄时间"] = value
+                # EXIF信息
+                if EXIF.get("Make"):
+                    result["basic"]["设备厂商"] = EXIF["Make"]
+                if EXIF.get("Model"):
+                    result["basic"]["设备型号"] = EXIF["Model"]
+                if EXIF.get("DateTimeOriginal"):
+                    result["basic"]["拍摄时间"] = EXIF["DateTimeOriginal"]
                             
-                            # 相机参数
-                            elif field == 'FNumber':
-                                result["camera"]["光圈值"] = f"f/{value}"
-                            elif field == "ExposureTime":
-                                try:
-                                    t = float(value)
-                                    if t < 1:
-                                        result["camera"]["快门"] = f"1/{round(1/t)}s"
-                                    else:
-                                        result["camera"]["快门"] = f"{t}s"
-                                except:
-                                    result["camera"]["快门"] = value
-                            elif field == 'ISO' or field == 'PhotographicSensitivity':
-                                result["camera"]["ISO感光度"] = value
-                            elif field == 'FocalLength':
-                                result["camera"]["焦距"] = f"{value}mm"
-                            elif field == 'Flash':
-                                result["camera"]["闪光灯"] = "有" if str(value) != "0" and 'No' not in str(value) else "无"
-                            elif field == 'WhiteBalance':
-                                result["camera"]["白平衡"] = "手动" if str(value) == "Manual" or str(value) == "1" else "自动"
-                            elif field == 'MeteringMode':
-                                metering_modes = {
-                                    "0": "未知", "1": "平均测光", "2": "中央重点平均测光", 
-                                    "3": "点测光", "4": "多点测光", "5": "图案测光", 
-                                    "6": "局部测光", "255": "其他", 
-                                    "Average": "平均测光", "Center-weighted average": "中央重点平均测光",
-                                    "Spot": "点测光", "Multi-segment": "多点测光", "Other": "其他"
-                                }
-                                result["camera"]["测光模式"] = metering_modes.get(str(value), str(value))
-                            elif field == 'ExposureProgram':
-                                exposure_programs = {
-                                    "0": "未定义", "1": "手动", "2": "程序", "3": "光圈优先", 
-                                    "4": "快门优先", "5": "创意程序", "6": "动作程序", 
-                                    "7": "人像模式", "8": "风景模式"
-                                }
-                                result["camera"]["曝光程序"] = exposure_programs.get(str(value), str(value))
+                # 相机参数
+                if EXIF.get("FNumber"):
+                    result["camera"]["光圈值"] = f"f/{EXIF['FNumber']}"
+                if EXIF.get("ExposureTime"):
+                    try:
+                        t = float(EXIF["ExposureTime"])
+                        if t < 1:
+                            result["camera"]["快门"] = f"1/{round(1/t)}s"
+                        else:
+                            result["camera"]["快门"] = f"{t}s"
+                    except:
+                        result["camera"]["快门"] = EXIF.get("ExposureTime")
+                if EXIF.get("ISO") or EXIF.get("PhotographicSensitivity"):
+                    result["camera"]["ISO感光度"] = EXIF.get("ISO") or EXIF.get("PhotographicSensitivity")
+                if EXIF.get("FocalLength"):
+                    result["camera"]["焦距"] = f"{EXIF['FocalLength']}mm"
+                if EXIF.get("Flash"):
+                    val = str(EXIF["Flash"])
+                    result["camera"]["闪光灯"] = "有" if val != "0" and 'No' not in val else "无"
+                if EXIF.get("WhiteBalance"):
+                    val = str(EXIF["WhiteBalance"])
+                    result["camera"]["白平衡"] = "手动" if val == "Manual" or val == "1" else "自动"
+                if EXIF.get("MeteringMode"):
+                    metering_modes = {
+                        "0": "未知", "1": "平均测光", "2": "中央重点平均测光", 
+                        "3": "点测光", "4": "多点测光", "5": "图案测光", 
+                        "6": "局部测光", "255": "其他", 
+                        "Average": "平均测光", "Center-weighted average": "中央重点平均测光",
+                        "Spot": "点测光", "Multi-segment": "多点测光", "Other": "其他"
+                    }
+                    result["camera"]["测光模式"] = metering_modes.get(str(EXIF["MeteringMode"]), str(EXIF["MeteringMode"]))
+                if EXIF.get("ExposureProgram"):
+                    exposure_programs = {
+                        "0": "未定义", "1": "手动", "2": "程序", "3": "光圈优先", 
+                        "4": "快门优先", "5": "创意程序", "6": "动作程序", 
+                        "7": "人像模式", "8": "风景模式"
+                    }
+                    result["camera"]["曝光程序"] = exposure_programs.get(str(EXIF["ExposureProgram"]), str(EXIF["ExposureProgram"]))
                             
-                            # 纬度
-                            if field == "GPSLatitude":
-                                try:
-                                    if '°' in value:
-                                        lat = self._parse_dms(value)
-                                    else:
-                                        lat = float(value)
-                                    ref = exiftool_data.get("EXIF:GPSLatitudeRef", "N")
-                                    if ref in ("S", "s"):
-                                        lat = -lat
-                                    result["gps"]["lat"] = round(lat, 6)
-                                except:    
-                                    pass
-                            # 经度
-                            if field == "GPSLongitude":
-                                try:
-                                    if '°' in value:
-                                        lon = self._parse_dms(value)
-                                    else:
-                                        lon = float(value)
-                                    ref = exiftool_data.get("EXIF:GPSLongitudeRef", "E")
-                                    if ref in ("W", "w"):
-                                        lon = -lon
-                                    result["gps"]["lon"] = round(lon, 6)
-                                except:    
-                                    pass
-                            
-                        # XMP信息
-                        elif 'xmp' in group.lower() or 'xmp.' in key.lower() or group in ['XMP-xmp', 'XMP-dc', 'XMP-xmpRights', 'XMP-photoshop', 'XMP-crs', 'XMP-aux']:
-                            xmp_field = field
-                            if 'xmp.xmp' in key.lower():
-                                xmp_field = key.split('.')[-1]
-                            elif 'xmp-' in key.lower():
-                                xmp_field = key.split('-', 1)[-1].split(':', 1)[-1]
-                            
-                            # 标准化XMP字段名称
-                            xmp_display_name = {
-                                'Title': '标题',
-                                'Description': '描述', 
-                                'Subject': '关键词',
-                                'Creator': '创作者',
-                                'Rights': '版权',
-                                'CreateDate': '创建日期',
-                                'ModifyDate': '修改日期',
-                                'CreatorTool': '创建工具',
-                                'Marked': '版权标记',
-                                'UsageTerms': '使用条款',
-                                'Lens': '镜头型号',
-                                'SerialNumber': '序列号',
-                                'City': '城市',
-                                'State': '州/省',
-                                'Country': '国家'
-                            }.get(xmp_field, xmp_field)
-                            
-                            result["xmp"][xmp_display_name] = value
-                            
-                        # IPTC信息
-                        elif group == 'IPTC':
-                            iptc_display_name = {
-                                'Keywords': '关键词',
-                                'By-line': '作者',
-                                'Headline': '标题',
-                                'Caption-Abstract': '描述',
-                                'CopyrightNotice': '版权',
-                                'ObjectName': '标题',
-                                'City': '城市',
-                                'Province-State': '州/省',
-                                'Country-PrimaryLocationName': '国家'
-                            }.get(field, field)
-                            
-                            result["xmp"][iptc_display_name] = value
-                
-                # 更新GPS字符串
-                if result["gps"]["lat"] is not None and result["gps"]["lon"] is not None:
-                    lat_ref = "N" if result["gps"]["lat"] >= 0 else "S"
-                    lon_ref = "E" if result["gps"]["lon"] >= 0 else "W"
-                    result["gps"]["str"] = f"纬度：{abs(result['gps']['lat']):.6f}° {lat_ref}，经度：{abs(result['gps']['lon']):.6f}° {lon_ref}"
-                else:
-                    # 尝试从其他GPS字段获取
-                    gps_lat = exiftool_data.get('Composite:GPSLatitude')
-                    gps_lon = exiftool_data.get('Composite:GPSLongitude')
-                    if gps_lat and gps_lon:
-                        try:
-                            lat = float(gps_lat)
-                            lon = float(gps_lon)
-                            lat_ref = "N" if lat >= 0 else "S"
-                            lon_ref = "E" if lon >= 0 else "W"
+                # 经纬度
+                try:
+                    lat = GPS.get("GPSLatitude")
+                    lon = GPS.get("GPSLongitude")
+
+                    if (lat is None or lon is None) and Composite:
+                        lat = Composite.get("GPSLatitude")
+                        lon = Composite.get("GPSLongitude")
+
+                    if lat is not None and lon is not None:
+                        lat = float(lat)
+                        lon = float(lon)
+        
+                        if -90 <= lat <= 90 and -180 <= lon <= 180:
                             result["gps"]["lat"] = lat
                             result["gps"]["lon"] = lon
+
+                            lat_ref = "N" if lat >= 0 else "S"
+                            lon_ref = "E" if lon >= 0 else "W"  
+        
                             result["gps"]["str"] = f"纬度：{abs(lat):.6f}° {lat_ref}，经度：{abs(lon):.6f}° {lon_ref}"
-                        except:
-                            pass
-                
-                # 提取其他有用的信息
-                if 'EXIF:Artist' in exiftool_data:
-                    result["exif"]["作者"] = exiftool_data['EXIF:Artist']
-                if 'EXIF:Copyright' in exiftool_data:
-                    result["exif"]["版权"] = exiftool_data['EXIF:Copyright']
-                if 'File:Software' in exiftool_data:
-                    result["exif"]["编辑软件"] = exiftool_data['File:Software']
-                if 'EXIF:LensModel' in exiftool_data:
-                    result["exif"]["镜头型号"] = exiftool_data['EXIF:LensModel']
-                if 'EXIF:ImageDescription' in exiftool_data:
-                    result["exif"]["图片描述"] = exiftool_data['EXIF:ImageDescription']
+                except Exception as e:
+                    logger.warning(f"GPS解析失败: {e}")
                 
                 # 其他EXIF数据
-                for key, value in exiftool_data.items():
-                    if ':' in key:
-                        group, field = key.split(':', 1)
-                        if group in ['EXIF', 'MakerNotes', 'QuickTime'] and field not in [
-                            'FNumber', 'ExposureTime', 'ISO', 'PhotographicSensitivity', 'FocalLength', 'Flash', 
-                            'WhiteBalance', 'MeteringMode', 'ExposureProgram',
-                            'GPSLatitude', 'GPSLongitude', 'GPSLatitudeRef', 'GPSLongitudeRef', 
-                            'Artist', 'Copyright', 'DateTimeOriginal', 'Make', 'Model',
-                            'ImageDescription', 'LensModel'
-                        ]:
-                            # 格式化显示名称
-                            display_field = field.replace('DigitalZoomRatio', '数码变焦').replace('FocalLengthIn35mmFormat', '35mm等效焦距')
-                            result["exif"][display_field] = str(value)
+                if EXIF.get("Artist"):
+                    result["exif"]["作者"] = EXIF["Artist"]
+                if EXIF.get("Copyright"):
+                    result["exif"]["版权"] = EXIF["Copyright"]
+                if EXIF.get("Software"):
+                    result["exif"]["编辑软件"] = EXIF["Software"]
+                if EXIF.get("LensModel"):
+                    result["exif"]["镜头型号"] = EXIF["LensModel"]
+                if EXIF.get("ImageDescription"):
+                    result["exif"]["图片描述"] = EXIF["ImageDescription"]
             else:
                 logger.error(f"exiftool解析失败: {exiftool_data.get('error', '未知错误')}")
                 result["error"] = exiftool_data.get("error", "exiftool不可用")
@@ -400,12 +312,6 @@ class ImageMetadataPlugin(Star):
             logger.warning(f"提取图片URL失败: {str(e)}")
         return img_url
     
-    def _parse_dms(self, dms_str: str) -> float:
-        dms_str = dms_str.replace('°', ' ').replace("'", ' ').replace('"', ' ').strip()
-        parts = list(map(float, dms_str.split()))
-        if len(parts) >= 3:
-            return parts[0] + parts[1]/60 + parts[2]/3600
-        return float(parts[0]) if parts else 0.0
 
     async def _process_metadata_analysis(self, event: AstrMessageEvent, image_path: str):
         """处理解析结果并发送"""
@@ -518,7 +424,7 @@ class ImageMetadataPlugin(Star):
             resp_str = f"地址解析失败（未知错误）\n{str(e)[:30]}..."
         return resp_str
 
-    @filter.command("imgmeta", "图片元数据", "解析")
+    @filter.command("imgmeta", alias={'图片元数据', '解析'} )
     async def imgmeta_handler(self, event: AstrMessageEvent, args=None):
         """主指令"""
         # 兼容不同版本的用户ID获取方式
