@@ -5,16 +5,51 @@ from astrbot.api.message_components import Image as MsgImage, Reply, Plain
 import astrbot.api.message_components as Comp
 import aiohttp
 import asyncio
-import exifread
 import os
 import tempfile
 import json
-from typing import Optional, Tuple
-# 添加XMP处理库
-try:
-    from lxml import etree
-except ImportError:
-    etree = None
+import subprocess
+import sys
+from typing import Optional
+
+
+# 初始化时运行安装检查
+def check_and_install_exiftool():
+    """检查并安装exiftool"""
+    # 检查install.txt文件
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    install_txt_path = os.path.join(script_dir, "install.txt")
+    install_txt_exists = os.path.exists(install_txt_path)
+    
+    if install_txt_exists:
+        try:
+            with open(install_txt_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if content == "done":  
+                return True
+            else:
+                logger.warning("exiftool不可用，将尝试自动安装")
+        except Exception as e:
+            logger.warning(f"读取install.txt时出错: {str(e)}")
+    
+    # 没有install.txt文件，运行安装程序
+    try:
+        install_script = os.path.join(os.path.dirname(__file__), "install.py")
+        if os.path.exists(install_script):
+            logger.info("正在运行install.py进行自动安装...")
+            result = subprocess.run([sys.executable, install_script], capture_output=True, text=True, timeout=300)
+            if result.returncode == 0:
+                logger.info("install.py执行完成")
+                return True
+            else:
+                logger.error(f"install.py执行失败: {result.stderr}")
+                return False
+    except subprocess.TimeoutExpired:
+        logger.error("install.py执行超时")
+        return False
+    except Exception as e:
+        logger.error(f"运行install.py时出错: {str(e)}")
+        return False
 
 
 @register(
@@ -63,236 +98,383 @@ class ImageMetadataPlugin(Star):
     async def initialize(self):
         """初始化HTTP客户端"""
         try:
-            connector = aiohttp.TCPConnector(ssl=False)
-            self.client = aiohttp.ClientSession(
-                connector=connector,
-                timeout=aiohttp.ClientTimeout(total=30)
-            )
+            self.client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
             logger.info("图片元数据解析插件初始化成功")
+            
+            # 在初始化时检查并安装exiftool
+            loop = asyncio.get_event_loop()
+            exiftool_available = await loop.run_in_executor(None, check_and_install_exiftool)
+            if not exiftool_available:
+                logger.error("exiftool不可用")
+                
         except Exception as e:
             logger.error(f"初始化HTTP客户端失败: {str(e)}")
             self.client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
 
-    def _safe_get_exif_value(self, tag_value) -> str:
-        """安全获取Exif值，处理bytes类型和Tag对象"""
+    def _extract_exiftool_data(self, image_path: str) -> dict:
+        """使用exiftool提取元数据"""
         try:
-            # 如果是bytes类型，尝试解码为字符串
-            if isinstance(tag_value, bytes):
-                # 优先尝试UTF-8解码，失败则用GBK，最后返回十六进制
-                try:
-                    return tag_value.decode('utf-8', errors='ignore').strip()
-                except:
-                    try:
-                        return tag_value.decode('gbk', errors='ignore').strip()
-                    except:
-                        return f"[二进制数据] 长度: {len(tag_value)} bytes"
+            # 获取所有元数据并输出为JSON格式
+            result = subprocess.run([
+                'exiftool', 
+                '-j',  # JSON输出
+                '-a',  # 显示重复的标签
+                '-u',  # 显示未知标签
+                '-g',  # 按组分组
+                image_path
+            ], capture_output=True, text=True, timeout=30)
             
-            # 如果是exifread的Tag对象，读取values属性
-            if hasattr(tag_value, 'values'):
-                # 处理values是列表的情况
-                if isinstance(tag_value.values, list):
-                    # 列表元素如果是bytes，解码后拼接
-                    values = []
-                    for v in tag_value.values:
-                        if isinstance(v, bytes):
-                            values.append(self._safe_get_exif_value(v))
-                        else:
-                            values.append(str(v))
-                    return ", ".join(values)
-                # 普通values值
-                return str(tag_value.values).strip()
+            if result.returncode != 0:
+                logger.error(f"exiftool执行失败: {result.stderr}")
+                return {"error": f"exiftool执行失败: {result.stderr}"}
             
-            # 其他类型直接转字符串
-            return str(tag_value).strip()
+            import json
+            data = json.loads(result.stdout)[0]  # 返回数组，取第一个元素
+
+            # 过滤并整理数据
+            filtered_data = {}
+            for key, value in data.items():
+                # 跳过一些内部标签
+                if key not in ['SourceFile', 'ExifTool:ExifToolVersion']:
+                    filtered_data[key] = str(value)
+            
+            return filtered_data
+        except subprocess.TimeoutExpired:
+            logger.error("exiftool执行超时")
+            return {"error": "exiftool执行超时"}
+        except json.JSONDecodeError:
+            logger.error("exiftool输出JSON解析失败")
+            return {"error": "JSON解析失败"}
         except Exception as e:
-            logger.warning(f"解析Exif值失败: {str(e)}")
-            return f"[解析失败] {str(e)[:10]}"
+            logger.error(f"exiftool执行出错: {str(e)}")
+            return {"error": f"exiftool执行出错: {str(e)}"}
 
-    def _convert_exif_gps(self, gps_coords, ref) -> float:
-        """GPS坐标转换为十进制（增加安全取值）"""
-        obj = 0.0
+    async def _parse_image_meta(self, image_path: str) -> dict:
+        """解析图片元数据"""
+        result = {
+            "basic": {},
+            "camera": {}, 
+            "xmp": {},
+            "exif": {},
+            "gps": {"lat": None, "lon": None, "str": "无GPS信息"},
+            "error": None
+        }
         try:
-            # 安全获取GPS度分秒值
-            deg_val = self._safe_get_exif_value(gps_coords.values[0])
-            min_val = self._safe_get_exif_value(gps_coords.values[1])
-            sec_val = self._safe_get_exif_value(gps_coords.values[2])
+            # 获取完整元数据
+            exiftool_data = await asyncio.get_event_loop().run_in_executor(None, self._extract_exiftool_data, image_path)
             
-            # 转换为浮点数
-            deg = float(deg_val) if deg_val.replace('.', '').isdigit() else 0.0
-            min_v = float(min_val) if min_val.replace('.', '').isdigit() else 0.0
-            sec_v = float(sec_val) if sec_val.replace('.', '').isdigit() else 0.0
-            
-            obj = deg + (min_v / 60.0) + (sec_v / 3600.0)
-            if ref in ['S', 'W']:
-                obj = -obj
-            obj = round(obj, 6)
-        except Exception as e:
-            logger.warning(f"GPS坐标转换失败: {str(e)}")
-            obj = 0.0
-        return obj
-
-    def _parse_gps_exifread(self, exif_tags) -> Tuple[Optional[float], Optional[float], str]:
-        """解析GPS信息（处理Tag对象）"""
-        lat = None
-        lon = None
-        gps_str = "无GPS信息"
-        try:
-            gps_lat = exif_tags.get('GPS GPSLatitude')
-            gps_lat_ref = exif_tags.get('GPS GPSLatitudeRef')
-            gps_lon = exif_tags.get('GPS GPSLongitude')
-            gps_lon_ref = exif_tags.get('GPS GPSLongitudeRef')
-
-            # 检查是否都是有效的Tag对象
-            if all([
-                gps_lat and hasattr(gps_lat, 'values'),
-                gps_lat_ref and hasattr(gps_lat_ref, 'values'),
-                gps_lon and hasattr(gps_lon, 'values'),
-                gps_lon_ref and hasattr(gps_lon_ref, 'values')
-            ]):
-                # 安全获取参考值
-                lat_ref = self._safe_get_exif_value(gps_lat_ref.values)
-                lon_ref = self._safe_get_exif_value(gps_lon_ref.values)
-                
-                lat = self._convert_exif_gps(gps_lat, lat_ref)
-                lon = self._convert_exif_gps(gps_lon, lon_ref)
-                
-                if lat == 0.0 and lon == 0.0:
-                    gps_str = "GPS坐标无效（值为0）"
-                else:
-                    gps_str = f"纬度：{lat}° {lat_ref}，经度：{lon}° {lon_ref}"
-            else:
-                gps_str = "无GPS信息"
-        except Exception as e:
-            logger.error(f"解析GPS失败: {str(e)}")
-            gps_str = f"GPS解析异常: {str(e)[:20]}..."
-        return lat, lon, gps_str
-
-    def _extract_xmp_data(self, image_path: str) -> dict:
-        """提取XMP元数据"""
-        xmp_data = {}
-        try:
-            if not etree:
-                return {"error": "缺少lxml库，无法解析XMP数据"}
-                
-            with open(image_path, 'rb') as f:
-                data = f.read()
-            
-            # 查找XMP数据块
-            xmp_start = data.find(b'<x:xmpmeta')
-            if xmp_start == -1:
-                xmp_start = data.find(b'<rdf:RDF')
-            if xmp_start == -1:
-                xmp_start = data.find(b'<xmpmeta')
-            
-            if xmp_start != -1:
-                # 找到结束标签
-                xmp_end = data.find(b'</x:xmpmeta>', xmp_start)
-                if xmp_end == -1:
-                    xmp_end = data.find(b'</rdf:RDF>', xmp_start)
-                if xmp_end != -1:
-                    xmp_end += len(b'</x:xmpmeta>') if b'</x:xmpmeta>' in data[xmp_start:xmp_end+20] else len(b'</rdf:RDF>')
-                    xmp_content = data[xmp_start:xmp_end]
-                    
-                    # 解析XML
-                    parser = etree.XMLParser(recover=True)
-                    root = etree.fromstring(xmp_content, parser=parser)
-                    
-                    # 定义常用的XMP命名空间
-                    namespaces = {
-                        'dc': 'http://purl.org/dc/elements/1.1/',
-                        'xmp': 'http://ns.adobe.com/xap/1.0/',
-                        'xmpRights': 'http://ns.adobe.com/xap/1.0/rights/',
-                        'xmpMM': 'http://ns.adobe.com/xap/1.0/mm/',
-                        'photoshop': 'http://ns.adobe.com/photoshop/1.0/',
-                        'tiff': 'http://ns.adobe.com/tiff/1.0/',
-                        'iptc': 'http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/',
-                        'crs': 'http://ns.adobe.com/camera-raw-settings/1.0/',
-                        'aux': 'http://ns.adobe.com/exif/1.0/aux/'
-                    }
-                    
-                    # 提取常见的XMP字段
-                    # 标题和描述
-                    title = root.find('.//dc:title/rdf:Alt/rdf:li', namespaces)
-                    if title is not None:
-                        xmp_data['标题'] = title.text
+            if exiftool_data and not exiftool_data.get("error"):
+                # 从数据中提取各类信息
+                for key, value in exiftool_data.items():
+                    # 基础信息
+                    if ':' in key:
+                        group, field = key.split(':', 1)
                         
-                    desc = root.find('.//dc:description/rdf:Alt/rdf:li', namespaces)
-                    if desc is not None:
-                        xmp_data['描述'] = desc.text
-                    
-                    # 关键词
-                    keywords = root.find('.//dc:subject/rdf:Bag', namespaces)
-                    if keywords is not None:
-                        keyword_list = []
-                        for li in keywords.findall('rdf:li', namespaces):
-                            if li.text:
-                                keyword_list.append(li.text)
-                        if keyword_list:
-                            xmp_data['关键词'] = ', '.join(keyword_list)
-                    
-                    # 作者和创作者
-                    creator = root.find('.//dc:creator/rdf:Seq/rdf:li', namespaces)
-                    if creator is not None:
-                        xmp_data['创作者'] = creator.text
-                    
-                    # 版权信息
-                    rights = root.xpath('//xmpRights:Marked | //xmpRights:UsageTerms/rdf:Alt/rdf:li', namespaces)
-                    for right in rights:
-                        if right.tag.endswith('Marked'):
-                            xmp_data['版权标记'] = '是' if right.text and right.text.lower() in ['true', 'yes'] else '否'
-                        elif right.tag.endswith('UsageTerms'):
-                            xmp_data['使用条款'] = right.text
-                    
-                    # 创建时间
-                    create_date = root.find('.//xmp:CreateDate', namespaces)
-                    if create_date is not None:
-                        xmp_data['创建日期'] = create_date.text
-                    
-                    # 修改时间
-                    mod_date = root.find('.//xmp:ModifyDate', namespaces)
-                    if mod_date is not None:
-                        xmp_data['修改日期'] = mod_date.text
-                    
-                    # 创建者工具
-                    creator_tool = root.find('.//xmp:CreatorTool', namespaces)
-                    if creator_tool is not None:
-                        xmp_data['创建工具'] = creator_tool.text
-                    
-                    # 相机原始设置（如果存在）
-                    lens_model = root.find('.//aux:Lens', namespaces)
-                    if lens_model is not None:
-                        xmp_data['镜头型号'] = lens_model.text
-                    
-                    serial_number = root.find('.//aux:SerialNumber', namespaces)
-                    if serial_number is not None:
-                        xmp_data['序列号'] = serial_number.text
-                    
-                    # IPTC信息
-                    city = root.find('.//photoshop:City', namespaces)
-                    if city is not None:
-                        xmp_data['城市'] = city.text
-                    
-                    state = root.find('.//photoshop:State', namespaces)
-                    if state is not None:
-                        xmp_data['州/省'] = state.text
-                    
-                    country = root.find('.//photoshop:Country', namespaces)
-                    if country is not None:
-                        xmp_data['国家'] = country.text
-            
+                        # 文件基本信息
+                        if group == 'File':
+                            if field == 'FileName':
+                                result["basic"]["文件名"] = value
+                            elif field == 'FileSize':
+                                result["basic"]["文件大小"] = value
+                            elif field == 'FileType':
+                                result["basic"]["文件格式"] = value
+                            elif field == 'ImageWidth':
+                                result["basic"]["宽度"] = f"{value} 像素"
+                            elif field == 'ImageHeight':
+                                result["basic"]["高度"] = f"{value} 像素"
+                            elif field == 'MIMEType':
+                                result["basic"]["MIME类型"] = value
+                            elif field == 'ModifyDate':
+                                result["basic"]["修改时间"] = value
+                        
+                        # EXIF信息
+                        elif group == 'EXIF':
+                            # 基本信息
+                            if field == 'Make':
+                                result["basic"]["设备厂商"] = value
+                            elif field == 'Model':
+                                result["basic"]["设备型号"] = value
+                            elif field == 'DateTimeOriginal':
+                                result["basic"]["拍摄时间"] = value
+                            
+                            # 相机参数
+                            elif field == 'FNumber':
+                                result["camera"]["光圈值"] = f"f/{value}"
+                            elif field == "ExposureTime":
+                                try:
+                                    t = float(value)
+                                    if t < 1:
+                                        result["camera"]["快门"] = f"1/{round(1/t)}s"
+                                    else:
+                                        result["camera"]["快门"] = f"{t}s"
+                                except:
+                                    result["camera"]["快门"] = value
+                            elif field == 'ISO' or field == 'PhotographicSensitivity':
+                                result["camera"]["ISO感光度"] = value
+                            elif field == 'FocalLength':
+                                result["camera"]["焦距"] = f"{value}mm"
+                            elif field == 'Flash':
+                                result["camera"]["闪光灯"] = "有" if str(value) != "0" and 'No' not in str(value) else "无"
+                            elif field == 'WhiteBalance':
+                                result["camera"]["白平衡"] = "手动" if str(value) == "Manual" or str(value) == "1" else "自动"
+                            elif field == 'MeteringMode':
+                                metering_modes = {
+                                    "0": "未知", "1": "平均测光", "2": "中央重点平均测光", 
+                                    "3": "点测光", "4": "多点测光", "5": "图案测光", 
+                                    "6": "局部测光", "255": "其他", 
+                                    "Average": "平均测光", "Center-weighted average": "中央重点平均测光",
+                                    "Spot": "点测光", "Multi-segment": "多点测光", "Other": "其他"
+                                }
+                                result["camera"]["测光模式"] = metering_modes.get(str(value), str(value))
+                            elif field == 'ExposureProgram':
+                                exposure_programs = {
+                                    "0": "未定义", "1": "手动", "2": "程序", "3": "光圈优先", 
+                                    "4": "快门优先", "5": "创意程序", "6": "动作程序", 
+                                    "7": "人像模式", "8": "风景模式"
+                                }
+                                result["camera"]["曝光程序"] = exposure_programs.get(str(value), str(value))
+                            
+                            # 纬度
+                            if field == "GPSLatitude":
+                                try:
+                                    if '°' in value:
+                                        lat = self._parse_dms(value)
+                                    else:
+                                        lat = float(value)
+                                    ref = exiftool_data.get("EXIF:GPSLatitudeRef", "N")
+                                    if ref in ("S", "s"):
+                                        lat = -lat
+                                    result["gps"]["lat"] = round(lat, 6)
+                                except:    
+                                    pass
+                            # 经度
+                            if field == "GPSLongitude":
+                                try:
+                                    if '°' in value:
+                                        lon = self._parse_dms(value)
+                                    else:
+                                        lon = float(value)
+                                    ref = exiftool_data.get("EXIF:GPSLongitudeRef", "E")
+                                    if ref in ("W", "w"):
+                                        lon = -lon
+                                    result["gps"]["lon"] = round(lon, 6)
+                                except:    
+                                    pass
+                            
+                        # XMP信息
+                        elif 'xmp' in group.lower() or 'xmp.' in key.lower() or group in ['XMP-xmp', 'XMP-dc', 'XMP-xmpRights', 'XMP-photoshop', 'XMP-crs', 'XMP-aux']:
+                            xmp_field = field
+                            if 'xmp.xmp' in key.lower():
+                                xmp_field = key.split('.')[-1]
+                            elif 'xmp-' in key.lower():
+                                xmp_field = key.split('-', 1)[-1].split(':', 1)[-1]
+                            
+                            # 标准化XMP字段名称
+                            xmp_display_name = {
+                                'Title': '标题',
+                                'Description': '描述', 
+                                'Subject': '关键词',
+                                'Creator': '创作者',
+                                'Rights': '版权',
+                                'CreateDate': '创建日期',
+                                'ModifyDate': '修改日期',
+                                'CreatorTool': '创建工具',
+                                'Marked': '版权标记',
+                                'UsageTerms': '使用条款',
+                                'Lens': '镜头型号',
+                                'SerialNumber': '序列号',
+                                'City': '城市',
+                                'State': '州/省',
+                                'Country': '国家'
+                            }.get(xmp_field, xmp_field)
+                            
+                            result["xmp"][xmp_display_name] = value
+                            
+                        # IPTC信息
+                        elif group == 'IPTC':
+                            iptc_display_name = {
+                                'Keywords': '关键词',
+                                'By-line': '作者',
+                                'Headline': '标题',
+                                'Caption-Abstract': '描述',
+                                'CopyrightNotice': '版权',
+                                'ObjectName': '标题',
+                                'City': '城市',
+                                'Province-State': '州/省',
+                                'Country-PrimaryLocationName': '国家'
+                            }.get(field, field)
+                            
+                            result["xmp"][iptc_display_name] = value
+                
+                # 更新GPS字符串
+                if result["gps"]["lat"] is not None and result["gps"]["lon"] is not None:
+                    lat_ref = "N" if result["gps"]["lat"] >= 0 else "S"
+                    lon_ref = "E" if result["gps"]["lon"] >= 0 else "W"
+                    result["gps"]["str"] = f"纬度：{abs(result['gps']['lat']):.6f}° {lat_ref}，经度：{abs(result['gps']['lon']):.6f}° {lon_ref}"
+                else:
+                    # 尝试从其他GPS字段获取
+                    gps_lat = exiftool_data.get('Composite:GPSLatitude')
+                    gps_lon = exiftool_data.get('Composite:GPSLongitude')
+                    if gps_lat and gps_lon:
+                        try:
+                            lat = float(gps_lat)
+                            lon = float(gps_lon)
+                            lat_ref = "N" if lat >= 0 else "S"
+                            lon_ref = "E" if lon >= 0 else "W"
+                            result["gps"]["lat"] = lat
+                            result["gps"]["lon"] = lon
+                            result["gps"]["str"] = f"纬度：{abs(lat):.6f}° {lat_ref}，经度：{abs(lon):.6f}° {lon_ref}"
+                        except:
+                            pass
+                
+                # 提取其他有用的信息
+                if 'EXIF:Artist' in exiftool_data:
+                    result["exif"]["作者"] = exiftool_data['EXIF:Artist']
+                if 'EXIF:Copyright' in exiftool_data:
+                    result["exif"]["版权"] = exiftool_data['EXIF:Copyright']
+                if 'File:Software' in exiftool_data:
+                    result["exif"]["编辑软件"] = exiftool_data['File:Software']
+                if 'EXIF:LensModel' in exiftool_data:
+                    result["exif"]["镜头型号"] = exiftool_data['EXIF:LensModel']
+                if 'EXIF:ImageDescription' in exiftool_data:
+                    result["exif"]["图片描述"] = exiftool_data['EXIF:ImageDescription']
+                
+                # 其他EXIF数据
+                for key, value in exiftool_data.items():
+                    if ':' in key:
+                        group, field = key.split(':', 1)
+                        if group in ['EXIF', 'MakerNotes', 'QuickTime'] and field not in [
+                            'FNumber', 'ExposureTime', 'ISO', 'PhotographicSensitivity', 'FocalLength', 'Flash', 
+                            'WhiteBalance', 'MeteringMode', 'ExposureProgram',
+                            'GPSLatitude', 'GPSLongitude', 'GPSLatitudeRef', 'GPSLongitudeRef', 
+                            'Artist', 'Copyright', 'DateTimeOriginal', 'Make', 'Model',
+                            'ImageDescription', 'LensModel'
+                        ]:
+                            # 格式化显示名称
+                            display_field = field.replace('DigitalZoomRatio', '数码变焦').replace('FocalLengthIn35mmFormat', '35mm等效焦距')
+                            result["exif"][display_field] = str(value)
+            else:
+                logger.error(f"exiftool解析失败: {exiftool_data.get('error', '未知错误')}")
+                result["error"] = exiftool_data.get("error", "exiftool不可用")
+
         except Exception as e:
-            logger.warning(f"解析XMP数据失败: {str(e)}")
-            xmp_data['error'] = f"XMP解析错误: {str(e)}"
-        
-        return xmp_data
+            result["error"] = str(e)[:80]
+            logger.error(f"解析元数据失败: {str(e)}")
+        return result
+
+    async def _download_image(self, image_url: str) -> Optional[str]:
+        """下载图片到临时文件"""
+        temp_path = None
+        try:
+            async with self.client.get(image_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP状态码错误: {resp.status}")
+                img_data = await resp.read()
+
+            temp_file = tempfile.NamedTemporaryFile(suffix=".tmp", delete=False)
+            temp_file.write(img_data)
+            temp_file.close()
+            temp_path = temp_file.name
+        except Exception as e:
+            logger.error(f"下载图片失败: {str(e)}")
+        return temp_path
+    async def extract_image_from_event(self, event: AstrMessageEvent) -> Optional[str]:
+        """提取消息中的图片URL"""
+        img_url = None
+        try:
+            for msg in event.get_messages():
+                if isinstance(msg, MsgImage):
+                    if hasattr(msg, "url") and msg.url:
+                        return msg.url.strip()
+                    if hasattr(msg, "file") and msg.file:
+                        return msg.file.strip()
+                    break
+            if not img_url:
+                for msg in event.get_messages():
+                    if isinstance(msg, Reply) and hasattr(msg, "chain"):
+                        for reply_msg in msg.chain:
+                            if isinstance(reply_msg, MsgImage) and hasattr(reply_msg, "url") and reply_msg.url:
+                                img_url = reply_msg.url.strip()
+                                break
+        except Exception as e:
+            logger.warning(f"提取图片URL失败: {str(e)}")
+        return img_url
+    
+    def _parse_dms(self, dms_str: str) -> float:
+        dms_str = dms_str.replace('°', ' ').replace("'", ' ').replace('"', ' ').strip()
+        parts = list(map(float, dms_str.split()))
+        if len(parts) >= 3:
+            return parts[0] + parts[1]/60 + parts[2]/3600
+        return float(parts[0]) if parts else 0.0
+
+    async def _process_metadata_analysis(self, event: AstrMessageEvent, image_path: str):
+        """处理解析结果并发送"""
+        try:
+            meta = await self._parse_image_meta(image_path)
+            chain = []
+
+            # 基础信息
+            if meta["basic"]:
+                basic_lines = ["【基础信息】"]
+                for k, v in meta["basic"].items():
+                    basic_lines.append(f"{k}：{v}")
+                chain.append(Comp.Plain("\n".join(basic_lines)))
+                chain.append(Comp.Plain("‎\n‎"))
+
+            # 相机参数信息
+            if meta["camera"]:  # 只有存在相机参数时才显示
+                camera_lines = ["【相机参数】"]
+                for k, v in meta["camera"].items():
+                    camera_lines.append(f"{k}：{v}")
+                chain.append(Comp.Plain("\n".join(camera_lines)))
+                chain.append(Comp.Plain("‎\n‎"))
+
+            # GPS信息
+            if meta["gps"]["str"] and "无GPS信息" not in meta["gps"]["str"]:
+                gps_lines = ["【GPS信息】", meta["gps"]["str"]]
+                if meta["gps"]["lat"] and meta["gps"]["lon"]:
+                    addr_str = await self._gps_to_address(meta["gps"]["lat"], meta["gps"]["lon"])
+                    gps_lines.append(addr_str)
+                chain.append(Comp.Plain("\n".join(gps_lines)))
+                chain.append(Comp.Plain("‎\n‎"))
+
+            # XMP信息
+            if meta["xmp"]:  # 只有存在XMP数据时才显示
+                xmp_lines = ["【XMP/IPTC元数据】"]
+                for k, v in meta["xmp"].items():
+                    xmp_lines.append(f"{k}：{v}")
+                chain.append(Comp.Plain("\n".join(xmp_lines)))
+                chain.append(Comp.Plain("‎\n‎"))
+
+            # Exif信息
+            exif_lines = ["【Exif详细数据】"]
+            if meta["exif"]:
+                exif_items = list(meta["exif"].items())[:self.max_exif_show]
+                for k, v in exif_items:
+                    if v and v != "None":
+                        exif_lines.append(f"{k}：{v}")
+                if len(meta["exif"]) > self.max_exif_show:
+                    exif_lines.append(f"（共{len(meta['exif'])}个字段，仅展示前{self.max_exif_show}个）")
+            else:
+                exif_lines.append("无详细EXIF数据")
+            chain.append(Comp.Plain("\n".join(exif_lines)))
+
+            # 错误信息
+            if meta["error"]:
+                chain.append(Comp.Plain(f"\n【解析提示】\n{meta['error']}"))
+
+            await event.send(event.chain_result(chain))
+        except Exception as e:
+            logger.error(f"处理解析结果失败: {str(e)}")
+            await event.send(event.plain_result(f"解析失败: {str(e)[:50]}..."))
 
     async def _gps_to_address(self, lat: float, lon: float) -> str:
         """高德地图逆地理编码"""
         if not self.amap_api_key:
-            return "未配置高德地图API Key\n请前往https://lbs.amap.com/申请Web服务API密钥，并在配置文件中设置 amap_api_key"
+            return "未配置高德地图API Key\n请前往 https://lbs.amap.com/ 申请Web服务API密钥，并在配置文件中设置 amap_api_key"
 
         if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-            return f"GPS坐标无效\n纬度范围需为[-90,90]，经度范围需为[-180,180]，当前：纬度{lat}，经度{lon}"
+            return f"GPS坐标无效\n纬度范围需为[-90,90]，经度范围需为[-180,180]，当前：纬度{lat:.6f}，经度{lon:.6f}"
 
         resp_str = ""
         try:
@@ -336,141 +518,15 @@ class ImageMetadataPlugin(Star):
             resp_str = f"地址解析失败（未知错误）\n{str(e)[:30]}..."
         return resp_str
 
-    def _parse_image_meta(self, image_path: str) -> dict:
-        """解析图片元数据（核心修复bytes属性错误）"""
-        result = {
-            "basic": {},
-            "camera": {},  # 新增相机参数信息
-            "xmp": {},     # 新增XMP数据
-            "exif": {},
-            "gps": {"lat": None, "lon": None, "str": "无GPS信息"},
-            "error": None
-        }
+    @filter.command("imgmeta", "图片元数据", "解析")
+    async def imgmeta_handler(self, event: AstrMessageEvent, args=None):
+        """主指令"""
+        # 兼容不同版本的用户ID获取方式
         try:
-            # 基础文件信息
-            file_size = os.path.getsize(image_path)
-            result["basic"]["文件大小(KB)"] = round(file_size / 1024, 2)
-            result["basic"]["文件大小(MB)"] = round(file_size / 1024 / 1024, 2)
-
-            # 获取文件扩展名和类型
-            _, file_ext = os.path.splitext(image_path)
-            result["basic"]["文件格式"] = file_ext.upper()[1:] if file_ext else "未知"
-
-            # 解析Exif（禁用详细模式，减少二进制数据）
-            with open(image_path, 'rb') as f:
-                exif_tags = exifread.process_file(f, details=False, stop_tag='GPS')
-
-            # 提取基础图片信息（安全取值）
-            if 'Image ImageWidth' in exif_tags:
-                width_val = self._safe_get_exif_value(exif_tags['Image ImageWidth'])
-                result["basic"]["宽度"] = f"{width_val} 像素"
-            if 'Image ImageLength' in exif_tags:
-                height_val = self._safe_get_exif_value(exif_tags['Image ImageLength'])
-                result["basic"]["高度"] = f"{height_val} 像素"
-            if 'Image Make' in exif_tags:
-                make_val = self._safe_get_exif_value(exif_tags['Image Make'])
-                result["basic"]["设备厂商"] = make_val
-            if 'Image Model' in exif_tags:
-                model_val = self._safe_get_exif_value(exif_tags['Image Model'])
-                result["basic"]["设备型号"] = model_val
-            if 'Image DateTime' in exif_tags:
-                dt_val = self._safe_get_exif_value(exif_tags['Image DateTime'])
-                result["basic"]["拍摄时间"] = dt_val
-
-            # 提取相机参数信息
-            if 'EXIF FNumber' in exif_tags:
-                fnum_val = self._safe_get_exif_value(exif_tags['EXIF FNumber'])
-                result["camera"]["光圈值"] = f"f/{fnum_val}"
-            if 'EXIF ExposureTime' in exif_tags:
-                exp_time_val = self._safe_get_exif_value(exif_tags['EXIF ExposureTime'])
-                result["camera"]["快门速度"] = f"1/{exp_time_val}s" if '/' in exp_time_val else f"{exp_time_val}s"
-            if 'EXIF ISOSpeedRatings' in exif_tags:
-                iso_val = self._safe_get_exif_value(exif_tags['EXIF ISOSpeedRatings'])
-                result["camera"]["ISO感光度"] = iso_val
-            if 'EXIF FocalLength' in exif_tags:
-                focal_val = self._safe_get_exif_value(exif_tags['EXIF FocalLength'])
-                result["camera"]["焦距"] = f"{focal_val}mm"
-            if 'EXIF Flash' in exif_tags:
-                flash_val = self._safe_get_exif_value(exif_tags['EXIF Flash'])
-                result["camera"]["闪光灯"] = "有" if flash_val != "0" else "无"
-            if 'EXIF WhiteBalance' in exif_tags:
-                wb_val = self._safe_get_exif_value(exif_tags['EXIF WhiteBalance'])
-                result["camera"]["白平衡"] = "手动" if wb_val == "1" else "自动"
-            if 'EXIF MeteringMode' in exif_tags:
-                metering_val = self._safe_get_exif_value(exif_tags['EXIF MeteringMode'])
-                metering_modes = {
-                    "0": "未知", "1": "平均测光", "2": "中央重点平均测光", 
-                    "3": "点测光", "4": "多点测光", "5": "图案测光", 
-                    "6": "局部测光", "255": "其他"
-                }
-                result["camera"]["测光模式"] = metering_modes.get(metering_val, "未知")
-
-            # 提取版权和作者信息
-            if 'Image Artist' in exif_tags:
-                artist_val = self._safe_get_exif_value(exif_tags['Image Artist'])
-                result["exif"]["作者"] = artist_val
-            if 'Image Copyright' in exif_tags:
-                copyright_val = self._safe_get_exif_value(exif_tags['Image Copyright'])
-                result["exif"]["版权"] = copyright_val
-            if 'Image Software' in exif_tags:
-                software_val = self._safe_get_exif_value(exif_tags['Image Software'])
-                result["exif"]["编辑软件"] = software_val
-
-            # 解析GPS
-            lat, lon, gps_str = self._parse_gps_exifread(exif_tags)
-            result["gps"]["lat"] = lat
-            result["gps"]["lon"] = lon
-            result["gps"]["str"] = gps_str
-
-            # 解析XMP数据
-            result["xmp"] = self._extract_xmp_data(image_path)
-
-            # 提取其他Exif字段（过滤二进制数据，安全取值）
-            exif_dict = {}
-            for tag, value in exif_tags.items():
-                # 跳过GPS相关（已单独解析）和已处理的基础信息
-                if tag.startswith('GPS') or tag in [
-                    'Image ImageWidth', 'Image ImageLength', 'Image Make', 
-                    'Image Model', 'Image DateTime', 'EXIF FNumber', 
-                    'EXIF ExposureTime', 'EXIF ISOSpeedRatings', 
-                    'EXIF FocalLength', 'EXIF Flash', 'EXIF WhiteBalance',
-                    'EXIF MeteringMode', 'Image Artist', 'Image Copyright', 
-                    'Image Software'
-                ]:
-                    continue
-                
-                # 安全获取值，避免bytes错误
-                val_str = self._safe_get_exif_value(value)
-                
-                # 过滤空值和过长的值
-                if val_str and val_str != "None" and len(val_str) < 200:
-                    exif_dict[tag.replace(' ', '_')] = val_str
-            
-            result["exif"].update(exif_dict)
-        except Exception as e:
-            result["error"] = str(e)[:80]
-            logger.error(f"解析元数据失败: {str(e)}")
-        return result
-
-    async def _download_image(self, image_url: str) -> Optional[str]:
-        """下载图片到临时文件"""
-        temp_path = None
-        try:
-            async with self.client.get(image_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP状态码错误: {resp.status}")
-                img_data = await resp.read()
-
-            temp_file = tempfile.NamedTemporaryFile(suffix=".tmp", delete=False, encoding=None)
-            temp_file.write(img_data)
-            temp_file.close()
-            temp_path = temp_file.name
-        except Exception as e:
-            logger.error(f"下载图片失败: {str(e)}")
-        return temp_path
-
-    async def extract_image_from_event(self, event: AstrMessageEvent) -> Optional[str]:
-        """提取消息中的图片URL"""
+            user_id = event.get_sender_id()
+        except:
+            user_id = str(event.user_id) if hasattr(event, 'user_id') else str(id(event))
+        
         img_url = None
         try:
             for msg in event.get_messages():
@@ -486,84 +542,11 @@ class ImageMetadataPlugin(Star):
                                 break
         except Exception as e:
             logger.warning(f"提取图片URL失败: {str(e)}")
-        return img_url
-
-    async def process_metadata_analysis(self, event: AstrMessageEvent, image_path: str):
-        """处理解析结果并发送"""
-        try:
-            meta = self._parse_image_meta(image_path)
-            chain = []
-
-            # 基础信息
-            basic_lines = ["【基础信息】"]
-            for k, v in meta["basic"].items():
-                basic_lines.append(f"{k}：{v}")
-            chain.append(Comp.Plain("\n".join(basic_lines)))
-            chain.append(Comp.Plain("‎\n‎"))
-
-            # 相机参数信息
-            if meta["camera"]:  # 只有存在相机参数时才显示
-                camera_lines = ["【相机参数】"]
-                for k, v in meta["camera"].items():
-                    camera_lines.append(f"{k}：{v}")
-                chain.append(Comp.Plain("\n".join(camera_lines)))
-                chain.append(Comp.Plain("‎\n‎"))
-
-            # GPS信息
-            gps_lines = ["【GPS信息】", meta["gps"]["str"]]
-            if meta["gps"]["lat"] and meta["gps"]["lon"]:
-                addr_str = await self._gps_to_address(meta["gps"]["lat"], meta["gps"]["lon"])
-                gps_lines.append(addr_str)
-            chain.append(Comp.Plain("\n".join(gps_lines)))
-            chain.append(Comp.Plain("‎\n‎"))
-
-            # XMP信息
-            if meta["xmp"] and not meta["xmp"].get("error"):  # 只有存在XMP数据且无错误时才显示
-                xmp_lines = ["【XMP元数据】"]
-                for k, v in meta["xmp"].items():
-                    xmp_lines.append(f"{k}：{v}")
-                chain.append(Comp.Plain("\n".join(xmp_lines)))
-                chain.append(Comp.Plain("‎\n‎"))
-            elif meta["xmp"] and meta["xmp"].get("error"):
-                chain.append(Comp.Plain(f"【XMP解析错误】\n{meta['xmp']['error']}\n"))
-
-            # Exif信息
-            exif_lines = ["【Exif详细数据】"]
-            if meta["exif"]:
-                exif_items = list(meta["exif"].items())[:self.max_exif_show]
-                for k, v in exif_items:
-                    if v and v != "None":
-                        exif_lines.append(f"{k}：{v}")
-                if len(meta["exif"]) > self.max_exif_show:
-                    exif_lines.append(f"（共{len(meta['exif'])}个字段，仅展示前{self.max_exif_show}个）")
-            else:
-                exif_lines.append("无")
-            chain.append(Comp.Plain("\n".join(exif_lines)))
-
-            # 错误信息
-            if meta["error"]:
-                chain.append(Comp.Plain(f"\n【解析提示】\n{meta['error']}"))
-
-            await event.send(event.chain_result(chain))
-        except Exception as e:
-            logger.error(f"处理解析结果失败: {str(e)}")
-            await event.send(event.plain_result(f"解析失败: {str(e)[:50]}..."))
-
-    @filter.command("imgmeta", "图片元数据", "解析")
-    async def imgmeta_handler(self, event: AstrMessageEvent, args=None):
-        """主指令"""
-        # 兼容不同版本的用户ID获取方式
-        try:
-            user_id = event.get_sender_id()
-        except:
-            user_id = str(event.user_id) if hasattr(event, 'user_id') else str(id(event))
-        
-        img_url = await self.extract_image_from_event(event)
 
         if img_url:
             temp_path = await self._download_image(img_url)
             if temp_path:
-                await self.process_metadata_analysis(event, temp_path)
+                await self._process_metadata_analysis(event, temp_path)
                 try:
                     os.unlink(temp_path)
                 except:
@@ -579,11 +562,12 @@ class ImageMetadataPlugin(Star):
         }
         if user_id in self.timeout_tasks:
             self.timeout_tasks[user_id].cancel()
-        self.timeout_tasks[user_id] = asyncio.create_task(self.timeout_check(user_id))
+            del self.timeout_tasks[user_id]
+        self.timeout_tasks[user_id] = asyncio.create_task(self._timeout_check(user_id))
         await event.send(event.plain_result(self.prompt_send_image))
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def on_message(self, event: AstrMessageEvent):
+    async def _on_message(self, event: AstrMessageEvent):
         """监听消息"""
         try:
             user_id = event.get_sender_id()
@@ -614,7 +598,7 @@ class ImageMetadataPlugin(Star):
         # 解析图片
         temp_path = await self._download_image(img_url)
         if temp_path:
-            await self.process_metadata_analysis(event, temp_path)
+            await self._process_metadata_analysis(event, temp_path)
             try:
                 os.unlink(temp_path)
             except:
@@ -622,7 +606,7 @@ class ImageMetadataPlugin(Star):
         else:
             await event.send(event.plain_result("图片下载失败"))
 
-    async def timeout_check(self, user_id: str):
+    async def _timeout_check(self, user_id: str):
         """超时检查"""
         try:
             await asyncio.sleep(self.timeout_seconds)
@@ -652,7 +636,3 @@ class ImageMetadataPlugin(Star):
         self.waiting_sessions.clear()
         self.timeout_tasks.clear()
         logger.info("图片元数据解析插件已优雅销毁")
-
-
-def setup(context: Context):
-    return ImageMetadataPlugin(context)
