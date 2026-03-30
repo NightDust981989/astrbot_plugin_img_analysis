@@ -6,7 +6,6 @@ def detect_os():
     """检测操作系统类型"""
     system = platform.system().lower()
     if system == "windows":
-        print("Windows暂不支持！")
         return "windows"
     elif system == "darwin":
         return "macos"
@@ -78,7 +77,7 @@ def install_exiftool_linux():
                 continue
         
         if not installed:
-            print("\n无法通过包管理器安装exiftool，请手动安装：")
+            print("\n无法通过包管理器安装exiftool，将使用本地版本兜底")
             return False
             
         return True
@@ -114,7 +113,8 @@ def main():
             write_install_flag()
             print("安装标记文件已创建: install.txt")
         except Exception as e:
-            print(f"创建标记文件失败: {str(e)}")
+            write_install_flag()
+            print(f"下载失败: {str(e)}，使用本地兜底")
         
         return True
     
@@ -125,6 +125,8 @@ def main():
         success = install_exiftool_macos()
     elif os_type == "linux":
         success = install_exiftool_linux()
+    elif os_type == "windows":
+        write_install_flag()
     else:
         return False
     
@@ -151,7 +153,7 @@ def main():
         
         return True
     else:
-        print("\nexiftool安装失败！")
+        print("\nexiftool安装失败，用本地版本兜底")
         return False
 
 if __name__ == "__main__":

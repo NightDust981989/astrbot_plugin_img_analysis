@@ -1,9 +1,6 @@
 # AstrBot图片元数据解析插件
 一款为 AstrBot 机器人开发的图片元数据解析插件，支持提取图片 Exif 信息、GPS 坐标，并通过高德地图 API 解析坐标对应的实际地址。
 
-## 提示
-由于技术原因，该插件目前不适配Windows平台，仅支持Linux/MacOS，并且需要终端拥有sudo权限，若不满足以上条件，请手动下载exiftool并加入系统PATH后再安装此插件。
-
 ## 功能特性
 - 提取图片基础信息：文件大小、分辨率、设备厂商/型号、拍摄时间
 - 解析图片 GPS 坐标（Exif 中的地理信息）
@@ -119,3 +116,4 @@ astrbot_plugin_img_analysis/
 ## 感谢
 - 高德地图 API
 - Whisky-Jay
+- exiftool

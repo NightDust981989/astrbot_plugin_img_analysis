@@ -11,6 +11,7 @@ import json
 import subprocess
 import sys
 from typing import Optional
+import shutil
 
 
 # 初始化时运行安装检查
@@ -56,7 +57,7 @@ def check_and_install_exiftool():
     "astrbot_plugin_img_analysis",
     "NightDust981989",
     "图片元数据解析插件",
-    "2.0.0",
+    "2.1.0",
     "https://github.com/NightDust981989/astrbot_plugin_img_analysis"
 )
 class ImageMetadataPlugin(Star):
@@ -118,9 +119,21 @@ class ImageMetadataPlugin(Star):
     def _extract_exiftool_data(self, image_path: str) -> dict:
         """使用exiftool提取元数据"""
         try:
+            plugin_dir = os.path.dirname(os.path.abspath(__file__))
+            exiftool_path = os.path.join(plugin_dir, "exiftool")
+
+            if sys.platform.startswith("win"):
+                # Windows强制本地
+                exiftool_path = os.path.join(plugin_dir, "exiftool-win", "exiftool.exe")
+            
+            elif sys.platform == "linux" or sys.platform == "darwin":
+                # Linux本地兜底
+                if not shutil.which("exiftool"):
+                    exiftool_path = os.path.join(plugin_dir, "exiftool-linux", "exiftool")
+            
             # 获取所有元数据并输出为JSON格式
             result = subprocess.run([
-                'exiftool', 
+                exiftool_path,
                 '-j',  # JSON输出
                 '-a',  # 显示重复的标签
                 '-u',  # 显示未知标签
