@@ -11,7 +11,7 @@
 ## 安装部署
 ### 1. 环境要求
 - Python ≥ 3.8
-- AstrBot 框架已安装
+- AstrBot ≥ 4.8.0
 
 ### 2. 安装步骤
 1. 下载插件 `astrbot_plugin_img_analysis` 并进入 AstrBot WebUI进行安装

@@ -57,7 +57,7 @@ def check_and_install_exiftool():
     "astrbot_plugin_img_analysis",
     "NightDust981989",
     "图片元数据解析插件",
-    "2.1.0",
+    "2.1.1",
     "https://github.com/NightDust981989/astrbot_plugin_img_analysis"
 )
 class ImageMetadataPlugin(Star):
@@ -146,7 +146,6 @@ class ImageMetadataPlugin(Star):
                 logger.error(f"exiftool执行失败: {result.stderr}")
                 return {"error": f"exiftool执行失败: {result.stderr}"}
             
-            import json
             data = json.loads(result.stdout)[0]  # 返回数组，取第一个元素
             return data
         
