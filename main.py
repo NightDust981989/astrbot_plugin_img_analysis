@@ -57,7 +57,7 @@ def check_and_install_exiftool():
     "astrbot_plugin_img_analysis",
     "NightDust981989",
     "图片元数据解析插件",
-    "2.1.1",
+    "2.1.2",
     "https://github.com/NightDust981989/astrbot_plugin_img_analysis"
 )
 class ImageMetadataPlugin(Star):
@@ -120,7 +120,7 @@ class ImageMetadataPlugin(Star):
         """使用exiftool提取元数据"""
         try:
             plugin_dir = os.path.dirname(os.path.abspath(__file__))
-            exiftool_path = os.path.join(plugin_dir, "exiftool")
+            exiftool_path = "exiftool"
 
             if sys.platform.startswith("win"):
                 # Windows强制本地
