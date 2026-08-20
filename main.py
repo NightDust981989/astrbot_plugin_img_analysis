@@ -6,7 +6,6 @@ import astrbot.api.message_components as Comp
 import aiohttp
 import asyncio
 import os
-import tempfile
 import json
 import subprocess
 import sys
@@ -57,7 +56,7 @@ def check_and_install_exiftool():
     "astrbot_plugin_img_analysis",
     "NightDust981989",
     "图片元数据解析插件",
-    "2.1.2",
+    "2.1.3",
     "https://github.com/NightDust981989/astrbot_plugin_img_analysis"
 )
 class ImageMetadataPlugin(Star):
@@ -286,43 +285,45 @@ class ImageMetadataPlugin(Star):
             logger.error(f"解析元数据失败: {str(e)}")
         return result
 
-    async def _download_image(self, image_url: str) -> Optional[str]:
-        """下载图片到临时文件"""
-        temp_path = None
-        try:
-            async with self.client.get(image_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP状态码错误: {resp.status}")
-                img_data = await resp.read()
-
-            temp_file = tempfile.NamedTemporaryFile(suffix=".tmp", delete=False)
-            temp_file.write(img_data)
-            temp_file.close()
-            temp_path = temp_file.name
-        except Exception as e:
-            logger.error(f"下载图片失败: {str(e)}")
-        return temp_path
-    async def extract_image_from_event(self, event: AstrMessageEvent) -> Optional[str]:
-        """提取消息中的图片URL"""
-        img_url = None
+    async def _get_image_path_from_event(self, event: AstrMessageEvent) -> Optional[str]:
+        """从事件中获取图片本地路径"""
         try:
             for msg in event.get_messages():
                 if isinstance(msg, MsgImage):
-                    if hasattr(msg, "url") and msg.url:
-                        return msg.url.strip()
-                    if hasattr(msg, "file") and msg.file:
-                        return msg.file.strip()
-                    break
-            if not img_url:
-                for msg in event.get_messages():
-                    if isinstance(msg, Reply) and hasattr(msg, "chain"):
-                        for reply_msg in msg.chain:
-                            if isinstance(reply_msg, MsgImage) and hasattr(reply_msg, "url") and reply_msg.url:
-                                img_url = reply_msg.url.strip()
-                                break
+                    try:
+                        path = await msg.convert_to_file_path()
+                        if path and os.path.isfile(path):
+                            return path
+                    except Exception as e:
+                        logger.warning(f"convert_to_file_path 失败: {e}")
+                elif isinstance(msg, Reply) and hasattr(msg, "chain"):
+                    for ref_msg in msg.chain:
+                        if isinstance(ref_msg, MsgImage):
+                            try:
+                                path = await ref_msg.convert_to_file_path()
+                                if path and os.path.isfile(path):
+                                    return path
+                            except Exception as e:
+                                logger.warning(f"引用图片 convert_to_file_path 失败: {e}")
         except Exception as e:
-            logger.warning(f"提取图片URL失败: {str(e)}")
-        return img_url
+            logger.warning(f"获取图片路径失败: {e}")
+        return None
+
+    @staticmethod
+    def _cleanup_temp_image(file_path: str) -> None:
+        """安全删除临时图片文件"""
+        try:
+            if not file_path or not os.path.isfile(file_path):
+                return
+            from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+            abs_path = os.path.abspath(file_path)
+            temp_dir = os.path.abspath(get_astrbot_temp_path())
+            if not abs_path.startswith(temp_dir):
+                logger.warning(f"拒绝删除非临时目录文件: {abs_path}")
+                return
+            os.remove(file_path)
+        except Exception:
+            pass
     
 
     async def _process_metadata_analysis(self, event: AstrMessageEvent, image_path: str):
@@ -444,33 +445,12 @@ class ImageMetadataPlugin(Star):
             user_id = event.get_sender_id()
         except:
             user_id = str(event.user_id) if hasattr(event, 'user_id') else str(id(event))
-        
-        img_url = None
-        try:
-            for msg in event.get_messages():
-                if isinstance(msg, MsgImage) and hasattr(msg, "url") and msg.url:
-                    img_url = msg.url.strip()
-                    break
-            if not img_url:
-                for msg in event.get_messages():
-                    if isinstance(msg, Reply) and hasattr(msg, "chain"):
-                        for reply_msg in msg.chain:
-                            if isinstance(reply_msg, MsgImage) and hasattr(reply_msg, "url") and reply_msg.url:
-                                img_url = reply_msg.url.strip()
-                                break
-        except Exception as e:
-            logger.warning(f"提取图片URL失败: {str(e)}")
 
-        if img_url:
-            temp_path = await self._download_image(img_url)
-            if temp_path:
-                await self._process_metadata_analysis(event, temp_path)
-                try:
-                    os.unlink(temp_path)
-                except:
-                    pass
-            else:
-                await event.send(event.plain_result("图片下载失败"))
+        image_path = await self._get_image_path_from_event(event)
+
+        if image_path:
+            await self._process_metadata_analysis(event, image_path)
+            self._cleanup_temp_image(image_path)
             return
 
         # 等待用户发送图片
@@ -503,7 +483,7 @@ class ImageMetadataPlugin(Star):
         if asyncio.get_event_loop().time() - session["timestamp"] > self.timeout_seconds:
             return
 
-        img_url = await self.extract_image_from_event(event)
+        img_url = await self._get_image_path_from_event(event)
         if not img_url:
             return
 
@@ -514,15 +494,8 @@ class ImageMetadataPlugin(Star):
             del self.timeout_tasks[user_id]
 
         # 解析图片
-        temp_path = await self._download_image(img_url)
-        if temp_path:
-            await self._process_metadata_analysis(event, temp_path)
-            try:
-                os.unlink(temp_path)
-            except:
-                pass
-        else:
-            await event.send(event.plain_result("图片下载失败"))
+        await self._process_metadata_analysis(event, img_url)
+        self._cleanup_temp_image(img_url)
 
     async def _timeout_check(self, user_id: str):
         """超时检查"""
